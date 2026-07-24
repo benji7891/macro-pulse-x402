@@ -28,12 +28,13 @@ by the underlying x402 EVM stack.
 import base64
 import os
 import random
+import re
 import time
 
 import httpx
 import jwt as pyjwt
 from cryptography.hazmat.primitives.asymmetric import ed25519
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from x402 import x402ResourceServer
 from x402.http import CreateHeadersAuthProvider, FacilitatorConfig, HTTPFacilitatorClient
 from x402.http.middleware.fastapi import payment_middleware
@@ -141,13 +142,19 @@ INDICATORS = {
 async def fetch_indicator(country_code: str, indicator: str) -> list[dict]:
     url = f"https://api.worldbank.org/v2/country/{country_code}/indicator/{indicator}"
     params = {"format": "json", "per_page": 6, "mrnev": 6}
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        if len(data) < 2 or not data[1]:
-            return []
-        return [row for row in data[1] if row["value"] is not None]
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+    except (httpx.HTTPError, ValueError):
+        # World Bank API is down/slow/returned bad JSON — degrade gracefully
+        # instead of bubbling up an unhandled exception (which would return a
+        # generic 500 to a client who already paid for this call).
+        return []
+    if not isinstance(data, list) or len(data) < 2 or not data[1]:
+        return []
+    return [row for row in data[1] if row.get("value") is not None]
 
 
 def compute_momentum(series: list[dict]) -> float | None:
@@ -161,8 +168,16 @@ def compute_momentum(series: list[dict]) -> float | None:
     return round(latest - avg_prior, 2)
 
 
+COUNTRY_CODE_RE = re.compile(r"^[A-Za-z]{2,3}$")
+
+
 @app.get("/macro-pulse/{country_code}")
 async def macro_pulse(country_code: str):
+    if not COUNTRY_CODE_RE.match(country_code):
+        raise HTTPException(
+            status_code=400,
+            detail="country_code must be a 2 or 3 letter ISO 3166-1 code, e.g. US, GB, DEU.",
+        )
     country_code = country_code.upper()
     results = {}
     for name, code in INDICATORS.items():
