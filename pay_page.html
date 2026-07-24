@@ -241,6 +241,22 @@ payBtn.addEventListener("click", async () => {
       }
     }
 
+    // If rejection happens BEFORE settlement is even attempted (payment header
+    // didn't parse, no matching requirements, extension mismatch, or the
+    // signature/authorization itself was rejected), there is no PAYMENT-RESPONSE
+    // header at all -- the real reason instead lives in the PAYMENT-REQUIRED
+    // header's `error` field (the same header used on the very first request,
+    // just re-sent with a specific error message this time).
+    let requiredInfo = null;
+    const requiredHeader = secondResp.headers.get("payment-required");
+    if (requiredHeader) {
+      try {
+        requiredInfo = jsonFromB64(requiredHeader);
+      } catch (e) {
+        requiredInfo = null;
+      }
+    }
+
     if (secondResp.status === 200) {
       append("\n✅ Payment succeeded! (status 200)\n\nResponse:\n" + secondBody);
       if (settleInfo) {
@@ -255,8 +271,13 @@ payBtn.addEventListener("click", async () => {
         append("\nSettlement details (from PAYMENT-RESPONSE header): " + JSON.stringify(settleInfo, null, 2));
       } else if (settleHeader) {
         append("\nSettlement header (raw, could not decode): " + settleHeader);
+      } else if (requiredInfo) {
+        append("\nRejection reason (from PAYMENT-REQUIRED header): " + (requiredInfo.error || JSON.stringify(requiredInfo)));
+        append("\n(No PAYMENT-RESPONSE header was present, so settlement was never attempted — this was rejected earlier, before/at verification.)");
+      } else if (requiredHeader) {
+        append("\nPAYMENT-REQUIRED header (raw, could not decode): " + requiredHeader);
       } else {
-        append("\n(No PAYMENT-RESPONSE header was present on this response — the facilitator gave no reason.)");
+        append("\n(No PAYMENT-RESPONSE or PAYMENT-REQUIRED header was present on this response — no reason given.)");
       }
       statusEl.className = "err";
     }
