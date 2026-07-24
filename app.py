@@ -53,6 +53,7 @@ CDP_API_KEY_SECRET = os.environ.get("CDP_API_KEY_SECRET")
 CDP_FACILITATOR_URL = "https://api.cdp.coinbase.com/platform/v2/x402"
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://macro-pulse-x402.onrender.com")
 PRICE = "$0.02"
+BATCH_PRICE = "$0.05"  # flat price for up to MAX_BATCH_COUNTRIES countries in one call
 ASSET_ADDRESS = "0x036CbD53842c5426634e7929541eC2318f3dCF7e" if NETWORK == "eip155:84532" else "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 
 app = FastAPI(title="Macro Pulse")
@@ -241,7 +242,51 @@ routes = {
                 }
             ),
         ),
-    }
+    },
+    "GET /macro-pulse-batch/:country_codes": {
+        "accepts": {
+            "scheme": "exact",
+            "payTo": PAY_TO_ADDRESS,
+            "price": BATCH_PRICE,
+            "network": NETWORK,
+        },
+        "description": (
+            "Same computed economic momentum score as /macro-pulse, but for up to "
+            "8 countries in a single call (comma-separated ISO codes). Flat price "
+            "regardless of country count -- cheaper than calling the single-country "
+            "endpoint repeatedly."
+        ),
+        "extensions": declare_discovery_extension(
+            path_params_schema={
+                "properties": {
+                    "country_codes": {
+                        "type": "string",
+                        "description": "Comma-separated ISO 3166-1 alpha-2 or alpha-3 country codes, e.g. US,GB,JP,DE (max 8)",
+                    }
+                },
+                "required": ["country_codes"],
+            },
+            output=OutputConfig(
+                example={
+                    "countries": {
+                        "US": {
+                            "country": "US",
+                            "momentum_score": 0.87,
+                            "momentum_label": "improving",
+                        },
+                        "GB": {
+                            "country": "GB",
+                            "momentum_score": -0.32,
+                            "momentum_label": "stable",
+                        },
+                    },
+                    "count": 2,
+                    "source": "World Bank Open Data (public domain, https://data.worldbank.org)",
+                    "disclaimer": "Directional context only. Not financial advice, not a buy/sell signal.",
+                }
+            ),
+        ),
+    },
 }
 
 
@@ -276,7 +321,28 @@ INDICATORS = {
 }
 
 
+# In-memory cache for World Bank indicator series. World Bank macro data
+# (annual GDP/inflation/unemployment) changes at most a few times a year, so
+# caching it aggressively costs nothing in freshness but buys a lot: (1) paid
+# calls no longer depend on World Bank's live API being fast/up at that exact
+# moment -- a customer who already paid shouldn't get a slow/failed response
+# because an upstream free API hiccuped; (2) a burst of agent traffic (bots,
+# retries, or the new batch endpoint below fanning out to many countries)
+# hits this cache instead of re-hammering World Bank on every request, which
+# is also what caused the worker-starvation issue behind the earlier 522s.
+# Only successful lookups are cached -- a failed/empty fetch is never stored,
+# so a transient World Bank outage self-heals on the next call instead of
+# being cached as "no data" for hours.
+_INDICATOR_CACHE: dict[tuple[str, str], tuple[float, list[dict]]] = {}
+INDICATOR_CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
+
+
 async def fetch_indicator(country_code: str, indicator: str) -> list[dict]:
+    cache_key = (country_code, indicator)
+    cached = _INDICATOR_CACHE.get(cache_key)
+    if cached is not None and (time.time() - cached[0]) < INDICATOR_CACHE_TTL_SECONDS:
+        return cached[1]
+
     url = f"https://api.worldbank.org/v2/country/{country_code}/indicator/{indicator}"
     params = {"format": "json", "per_page": 6, "mrnev": 6}
     try:
@@ -287,11 +353,16 @@ async def fetch_indicator(country_code: str, indicator: str) -> list[dict]:
     except (httpx.HTTPError, ValueError):
         # World Bank API is down/slow/returned bad JSON — degrade gracefully
         # instead of bubbling up an unhandled exception (which would return a
-        # generic 500 to a client who already paid for this call).
+        # generic 500 to a client who already paid for this call). Do NOT
+        # cache this outcome, so the next request retries against the live
+        # API instead of being stuck with "no data" for the full TTL.
         return []
     if not isinstance(data, list) or len(data) < 2 or not data[1]:
         return []
-    return [row for row in data[1] if row.get("value") is not None]
+    series = [row for row in data[1] if row.get("value") is not None]
+    if series:
+        _INDICATOR_CACHE[cache_key] = (time.time(), series)
+    return series
 
 
 def compute_momentum(series: list[dict]) -> float | None:
@@ -308,14 +379,8 @@ def compute_momentum(series: list[dict]) -> float | None:
 COUNTRY_CODE_RE = re.compile(r"^[A-Za-z]{2,3}$")
 
 
-@app.get("/macro-pulse/{country_code}")
-async def macro_pulse(country_code: str):
-    if not COUNTRY_CODE_RE.match(country_code):
-        raise HTTPException(
-            status_code=400,
-            detail="country_code must be a 2 or 3 letter ISO 3166-1 code, e.g. US, GB, DEU.",
-        )
-    country_code = country_code.upper()
+async def _compute_macro_pulse(country_code: str) -> dict:
+    """Shared computation used by both the single-country and batch endpoints."""
     results = {}
     for name, code in INDICATORS.items():
         series = await fetch_indicator(country_code, code)
@@ -357,6 +422,59 @@ async def macro_pulse(country_code: str):
     }
 
 
+@app.get("/macro-pulse/{country_code}")
+async def macro_pulse(country_code: str):
+    if not COUNTRY_CODE_RE.match(country_code):
+        raise HTTPException(
+            status_code=400,
+            detail="country_code must be a 2 or 3 letter ISO 3166-1 code, e.g. US, GB, DEU.",
+        )
+    return await _compute_macro_pulse(country_code.upper())
+
+
+MAX_BATCH_COUNTRIES = 8
+
+
+@app.get("/macro-pulse-batch/{country_codes}")
+async def macro_pulse_batch(country_codes: str):
+    """Higher-value bundled endpoint: many countries in one paid call.
+
+    Priced flat (see BATCH_PRICE / routes below) regardless of how many
+    countries are requested (up to MAX_BATCH_COUNTRIES). Because indicator
+    lookups are cached (see fetch_indicator), the marginal backend cost of
+    each extra country in a batch is near zero, so this bundle earns
+    materially more per call than the single-country endpoint while still
+    undercutting what the same countries would cost as separate calls
+    (up to MAX_BATCH_COUNTRIES x $0.02), giving agents a real incentive to
+    use it instead of looping the single-country endpoint.
+    """
+    codes = [c.strip().upper() for c in country_codes.split(",") if c.strip()]
+    if not codes:
+        raise HTTPException(status_code=400, detail="Provide at least one country code.")
+    if len(codes) > MAX_BATCH_COUNTRIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Maximum {MAX_BATCH_COUNTRIES} countries per batch call. Got {len(codes)}.",
+        )
+    for c in codes:
+        if not COUNTRY_CODE_RE.match(c):
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{c}' is not a valid 2 or 3 letter ISO 3166-1 code.",
+            )
+    # Dedupe while preserving order so a lazy/buggy caller repeating a code
+    # doesn't get charged for redundant work either.
+    seen = set()
+    unique_codes = [c for c in codes if not (c in seen or seen.add(c))]
+    countries = {c: await _compute_macro_pulse(c) for c in unique_codes}
+    return {
+        "countries": countries,
+        "count": len(countries),
+        "source": "World Bank Open Data (public domain, https://data.worldbank.org)",
+        "disclaimer": "Directional context only. Not financial advice, not a buy/sell signal.",
+    }
+
+
 @app.get("/pay", response_class=HTMLResponse)
 async def pay_page():
     """Self-serve bootstrap-payment page.
@@ -377,8 +495,14 @@ async def pay_page():
 async def root():
     return {
         "service": "Macro Pulse",
-        "endpoint": "/macro-pulse/{country_code}  e.g. /macro-pulse/US",
-        "price": PRICE,
+        "endpoints": {
+            "/macro-pulse/{country_code}": {"price": PRICE, "example": "/macro-pulse/US"},
+            "/macro-pulse-batch/{country_codes}": {
+                "price": BATCH_PRICE,
+                "example": "/macro-pulse-batch/US,GB,JP",
+                "max_countries": MAX_BATCH_COUNTRIES,
+            },
+        },
         "network": NETWORK,
     }
 
@@ -412,6 +536,29 @@ async def x402_discovery_manifest():
                     },
                     "required": ["country_code"],
                 },
-            }
+            },
+            {
+                "resource": f"{PUBLIC_BASE_URL}/macro-pulse-batch/{{country_codes}}",
+                "method": "GET",
+                "description": (
+                    "Same momentum score as /macro-pulse, for up to 8 countries in one "
+                    "call (comma-separated ISO codes). Flat price, cheaper than repeated "
+                    "single-country calls."
+                ),
+                "price": BATCH_PRICE,
+                "network": NETWORK,
+                "asset": ASSET_ADDRESS,
+                "payTo": PAY_TO_ADDRESS,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "country_codes": {
+                            "type": "string",
+                            "description": "Comma-separated ISO 3166-1 alpha-2 country codes, e.g. US,GB,JP,DE (max 8)",
+                        }
+                    },
+                    "required": ["country_codes"],
+                },
+            },
         ],
     }
