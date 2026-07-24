@@ -116,47 +116,89 @@ server = x402ResourceServer(facilitator)
 register_exact_evm_server(server, networks=NETWORK)
 
 # --- Temporary debug logging -------------------------------------------------
-# The x402 middleware deliberately returns an empty body on settlement failure
-# (so payer clients don't see internal details), which makes it impossible to
-# diagnose failures from the outside. Wrap verify_payment/settle_payment on our
-# own server instance so the *real* error_reason/error_message/invalid_reason
-# always land in this service's logs (visible via the Render dashboard/API),
-# regardless of what the client displays or caches.
-import logging
+# The x402 middleware deliberately returns an empty body on failure (so payer
+# clients don't see internal details), which makes it impossible to diagnose
+# failures from the outside. Wrap the key server methods on our own server
+# instance with plain print()s (guaranteed to reach Render's log stream,
+# unlike the logging module which can get swallowed by uvicorn's own config)
+# so we can see exactly which step rejects the payment and why.
+import sys
 
-_debug_logger = logging.getLogger("x402_debug")
-_debug_logger.setLevel(logging.WARNING)
 
+def _dbg(*parts):
+    print("X402_DEBUG", *parts, file=sys.stdout, flush=True)
+
+
+_orig_find_matching_requirements = server.find_matching_requirements
+_orig_validate_extensions = server.validate_extensions
 _orig_verify_payment = server.verify_payment
 _orig_settle_payment = server.settle_payment
 
 
-async def _debug_verify_payment(*args, **kwargs):
-    result = await _orig_verify_payment(*args, **kwargs)
+def _debug_find_matching_requirements(available, payload):
+    result = _orig_find_matching_requirements(available, payload)
     try:
-        _debug_logger.warning(
-            "X402_DEBUG verify_payment -> is_valid=%s invalid_reason=%s invalid_message=%s payer=%s",
-            result.is_valid, result.invalid_reason, result.invalid_message, result.payer,
+        _dbg(
+            "find_matching_requirements -> matched=", result is not None,
+            "| available=", [(r.network, r.asset, r.pay_to, r.amount) for r in available],
+            "| payload.accepted=", getattr(payload, "accepted", None),
         )
-    except Exception:
-        _debug_logger.exception("X402_DEBUG verify_payment logging failed")
+    except Exception as e:
+        _dbg("find_matching_requirements logging failed:", repr(e))
+    return result
+
+
+def _debug_validate_extensions(payment_required, payment_payload):
+    result = _orig_validate_extensions(payment_required, payment_payload)
+    try:
+        _dbg("validate_extensions -> valid=", result.valid, "invalid_reason=", result.invalid_reason)
+    except Exception as e:
+        _dbg("validate_extensions logging failed:", repr(e))
+    return result
+
+
+async def _debug_verify_payment(*args, **kwargs):
+    try:
+        result = await _orig_verify_payment(*args, **kwargs)
+    except Exception as e:
+        _dbg("verify_payment RAISED:", repr(e))
+        raise
+    try:
+        _dbg(
+            "verify_payment -> is_valid=", result.is_valid,
+            "invalid_reason=", result.invalid_reason,
+            "invalid_message=", result.invalid_message,
+            "payer=", result.payer,
+        )
+    except Exception as e:
+        _dbg("verify_payment logging failed:", repr(e))
     return result
 
 
 async def _debug_settle_payment(*args, **kwargs):
-    result = await _orig_settle_payment(*args, **kwargs)
     try:
-        _debug_logger.warning(
-            "X402_DEBUG settle_payment -> success=%s error_reason=%s error_message=%s transaction=%s payer=%s",
-            result.success, result.error_reason, result.error_message, result.transaction, result.payer,
+        result = await _orig_settle_payment(*args, **kwargs)
+    except Exception as e:
+        _dbg("settle_payment RAISED:", repr(e))
+        raise
+    try:
+        _dbg(
+            "settle_payment -> success=", result.success,
+            "error_reason=", result.error_reason,
+            "error_message=", result.error_message,
+            "transaction=", result.transaction,
+            "payer=", result.payer,
         )
-    except Exception:
-        _debug_logger.exception("X402_DEBUG settle_payment logging failed")
+    except Exception as e:
+        _dbg("settle_payment logging failed:", repr(e))
     return result
 
 
+server.find_matching_requirements = _debug_find_matching_requirements
+server.validate_extensions = _debug_validate_extensions
 server.verify_payment = _debug_verify_payment
 server.settle_payment = _debug_settle_payment
+_dbg("debug wrappers installed at startup")
 # --- End temporary debug logging ---------------------------------------------
 
 routes = {
