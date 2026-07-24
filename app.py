@@ -36,6 +36,7 @@ import jwt as pyjwt
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from fastapi import FastAPI, HTTPException, Request
 from x402 import x402ResourceServer
+from x402.extensions.bazaar import OutputConfig, declare_discovery_extension
 from x402.http import CreateHeadersAuthProvider, FacilitatorConfig, HTTPFacilitatorClient
 from x402.http.middleware.fastapi import payment_middleware
 from x402.mechanisms.evm.exact.register import register_exact_evm_server
@@ -114,7 +115,7 @@ server = x402ResourceServer(facilitator)
 register_exact_evm_server(server, networks=NETWORK)
 
 routes = {
-    "GET /macro-pulse/*": {
+    "GET /macro-pulse/:country_code": {
         "accepts": {
             "scheme": "exact",
             "payTo": PAY_TO_ADDRESS,
@@ -122,6 +123,37 @@ routes = {
             "network": NETWORK,
         },
         "description": "Computed economic momentum score for a country (GDP growth, inflation, unemployment trend, synthesized into a single directional signal).",
+        # Bazaar discovery metadata: once this route completes its first real
+        # settlement through the CDP facilitator, Coinbase's Bazaar catalog
+        # (https://api.cdp.coinbase.com/platform/v2/x402/discovery/resources)
+        # will index it using this description/schema/example so agents can
+        # find and evaluate it programmatically. The payment_middleware below
+        # auto-registers the bazaar extension because this key is present.
+        "extensions": declare_discovery_extension(
+            path_params_schema={
+                "properties": {
+                    "country_code": {
+                        "type": "string",
+                        "description": "ISO 3166-1 alpha-2 or alpha-3 country code, e.g. US, GB, JP, DEU",
+                    }
+                },
+                "required": ["country_code"],
+            },
+            output=OutputConfig(
+                example={
+                    "country": "US",
+                    "indicators": {
+                        "gdp_growth": {"latest_value": 2.8, "latest_year": "2024", "trend_momentum": 0.6},
+                        "inflation": {"latest_value": 2.9, "latest_year": "2024", "trend_momentum": -1.1},
+                        "unemployment": {"latest_value": 4.1, "latest_year": "2024", "trend_momentum": -0.2},
+                    },
+                    "momentum_score": 0.87,
+                    "momentum_label": "improving",
+                    "source": "World Bank Open Data (public domain, https://data.worldbank.org)",
+                    "disclaimer": "Directional context only. Not financial advice, not a buy/sell signal.",
+                }
+            ),
+        ),
     }
 }
 
