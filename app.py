@@ -30,7 +30,9 @@ from x402.mechanisms.evm.exact.register import register_exact_evm_server
 PAY_TO_ADDRESS = os.environ.get("PAY_TO_ADDRESS", "0xREPLACE_WITH_YOUR_BASE_WALLET_ADDRESS")
 NETWORK = os.environ.get("NETWORK", "eip155:84532")  # default: Base Sepolia TESTNET
 FACILITATOR_URL = os.environ.get("FACILITATOR_URL", "https://x402.org/facilitator")
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://macro-pulse-x402.onrender.com")
 PRICE = "$0.02"
+ASSET_ADDRESS = "0x036CbD53842c5426634e7929541eC2318f3dCF7e" if NETWORK == "eip155:84532" else "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 
 app = FastAPI(title="Macro Pulse")
 
@@ -138,4 +140,38 @@ async def root():
         "endpoint": "/macro-pulse/{country_code}  e.g. /macro-pulse/US",
         "price": PRICE,
         "network": NETWORK,
+    }
+
+
+# Machine-readable discovery manifest — lets x402 directories (x402scan,
+# x402-list, agentcash, etc.) and AI agents find this service automatically.
+@app.get("/.well-known/x402")
+async def x402_discovery_manifest():
+    return {
+        "x402Version": 2,
+        "resources": [
+            {
+                "resource": f"{PUBLIC_BASE_URL}/macro-pulse/{{country_code}}",
+                "method": "GET",
+                "description": (
+                    "Computed economic momentum score for any country (ISO-2 code, e.g. US, GB, JP). "
+                    "Synthesizes GDP growth, inflation, and unemployment trend data from the World Bank "
+                    "into a single directional signal (improving / stable / deteriorating)."
+                ),
+                "price": PRICE,
+                "network": NETWORK,
+                "asset": ASSET_ADDRESS,
+                "payTo": PAY_TO_ADDRESS,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "country_code": {
+                            "type": "string",
+                            "description": "ISO 3166-1 alpha-2 country code, e.g. US, GB, JP, DE",
+                        }
+                    },
+                    "required": ["country_code"],
+                },
+            }
+        ],
     }
