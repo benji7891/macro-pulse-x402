@@ -115,6 +115,50 @@ facilitator = HTTPFacilitatorClient(facilitator_config)
 server = x402ResourceServer(facilitator)
 register_exact_evm_server(server, networks=NETWORK)
 
+# --- Temporary debug logging -------------------------------------------------
+# The x402 middleware deliberately returns an empty body on settlement failure
+# (so payer clients don't see internal details), which makes it impossible to
+# diagnose failures from the outside. Wrap verify_payment/settle_payment on our
+# own server instance so the *real* error_reason/error_message/invalid_reason
+# always land in this service's logs (visible via the Render dashboard/API),
+# regardless of what the client displays or caches.
+import logging
+
+_debug_logger = logging.getLogger("x402_debug")
+_debug_logger.setLevel(logging.WARNING)
+
+_orig_verify_payment = server.verify_payment
+_orig_settle_payment = server.settle_payment
+
+
+async def _debug_verify_payment(*args, **kwargs):
+    result = await _orig_verify_payment(*args, **kwargs)
+    try:
+        _debug_logger.warning(
+            "X402_DEBUG verify_payment -> is_valid=%s invalid_reason=%s invalid_message=%s payer=%s",
+            result.is_valid, result.invalid_reason, result.invalid_message, result.payer,
+        )
+    except Exception:
+        _debug_logger.exception("X402_DEBUG verify_payment logging failed")
+    return result
+
+
+async def _debug_settle_payment(*args, **kwargs):
+    result = await _orig_settle_payment(*args, **kwargs)
+    try:
+        _debug_logger.warning(
+            "X402_DEBUG settle_payment -> success=%s error_reason=%s error_message=%s transaction=%s payer=%s",
+            result.success, result.error_reason, result.error_message, result.transaction, result.payer,
+        )
+    except Exception:
+        _debug_logger.exception("X402_DEBUG settle_payment logging failed")
+    return result
+
+
+server.verify_payment = _debug_verify_payment
+server.settle_payment = _debug_settle_payment
+# --- End temporary debug logging ---------------------------------------------
+
 routes = {
     "GET /macro-pulse/:country_code": {
         "accepts": {
