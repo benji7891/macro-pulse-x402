@@ -5,22 +5,37 @@ public-domain World Bank data (no licensed/paid feeds involved).
 
 Endpoint: GET /macro-pulse/{country_code}   price: $0.02 per call
 
-Before going live on mainnet you need to set two environment variables:
-  PAY_TO_ADDRESS   -> your own Base wallet address (0x...) that will receive USDC
-  NETWORK          -> "eip155:84532" for Base Sepolia TESTNET (safe to test with)
-                      "eip155:8453"  for Base MAINNET (real money)
+Before going live on mainnet you need to set these environment variables:
+  PAY_TO_ADDRESS      -> your own Base wallet address (0x...) that will receive USDC
+  NETWORK             -> "eip155:84532" for Base Sepolia TESTNET (safe to test with)
+                         "eip155:8453"  for Base MAINNET (real money)
+  CDP_API_KEY_ID       -> Coinbase Developer Platform Secret API Key ID (mainnet only)
+  CDP_API_KEY_SECRET   -> Coinbase Developer Platform Secret API Key secret (mainnet only)
 
 For testing, the public facilitator at https://x402.org/facilitator works
-on Base Sepolia testnet only. For MAINNET settlement, you need a facilitator
-that supports Base mainnet — Coinbase's hosted facilitator (via a free
-Coinbase Developer Platform API key) is the standard choice.
+on Base Sepolia testnet only, no auth required. For MAINNET settlement, this
+app switches to Coinbase's hosted CDP facilitator, which requires signed
+requests. Each request to the CDP facilitator is authenticated with a short
+lived JWT ("Bearer" token) built from your CDP Secret API Key, following the
+same scheme Coinbase's own SDKs use (JWT signed with the Ed25519 key, header
+carries the key id + a nonce, payload carries a "uris" claim binding the
+token to the exact HTTP method+host+path being called, 120s expiry). This is
+implemented locally below (no extra Coinbase SDK dependency needed) using
+only PyJWT + cryptography, both of which are lightweight and already needed
+by the underlying x402 EVM stack.
 """
 
+import base64
 import os
+import random
+import time
+
 import httpx
+import jwt as pyjwt
+from cryptography.hazmat.primitives.asymmetric import ed25519
 from fastapi import FastAPI, Request
 from x402 import x402ResourceServer
-from x402.http import FacilitatorConfig, HTTPFacilitatorClient
+from x402.http import CreateHeadersAuthProvider, FacilitatorConfig, HTTPFacilitatorClient
 from x402.http.middleware.fastapi import payment_middleware
 from x402.mechanisms.evm.exact.register import register_exact_evm_server
 
@@ -30,13 +45,70 @@ from x402.mechanisms.evm.exact.register import register_exact_evm_server
 PAY_TO_ADDRESS = os.environ.get("PAY_TO_ADDRESS", "0xREPLACE_WITH_YOUR_BASE_WALLET_ADDRESS")
 NETWORK = os.environ.get("NETWORK", "eip155:84532")  # default: Base Sepolia TESTNET
 FACILITATOR_URL = os.environ.get("FACILITATOR_URL", "https://x402.org/facilitator")
+CDP_API_KEY_ID = os.environ.get("CDP_API_KEY_ID")
+CDP_API_KEY_SECRET = os.environ.get("CDP_API_KEY_SECRET")
+CDP_FACILITATOR_URL = "https://api.cdp.coinbase.com/platform/v2/x402"
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://macro-pulse-x402.onrender.com")
 PRICE = "$0.02"
 ASSET_ADDRESS = "0x036CbD53842c5426634e7929541eC2318f3dCF7e" if NETWORK == "eip155:84532" else "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 
 app = FastAPI(title="Macro Pulse")
 
-facilitator = HTTPFacilitatorClient(FacilitatorConfig(url=FACILITATOR_URL))
+
+def _generate_cdp_jwt(method: str, path: str, expires_in: int = 120) -> str:
+    """Build a short-lived Bearer JWT for one CDP facilitator request.
+
+    Mirrors Coinbase's own JWT construction (see cdp-sdk's
+    cdp.auth.utils.jwt.generate_jwt) so we can authenticate without pulling
+    in the full cdp-sdk package (which drags in web3/solana deps we don't
+    need for a read-only facilitator client).
+    """
+    secret_bytes = base64.b64decode(CDP_API_KEY_SECRET)
+    if len(secret_bytes) != 64:
+        raise ValueError(
+            "CDP_API_KEY_SECRET must be the base64 Ed25519 secret from the CDP "
+            "'Create secret API key' modal (64 raw bytes once decoded)."
+        )
+    private_key = ed25519.Ed25519PrivateKey.from_private_bytes(secret_bytes[:32])
+
+    nonce = "".join(random.choices("0123456789", k=16))
+    header = {"alg": "EdDSA", "kid": CDP_API_KEY_ID, "typ": "JWT", "nonce": nonce}
+
+    now = int(time.time())
+    uri = f"{method} api.cdp.coinbase.com{path}"
+    claims = {
+        "sub": CDP_API_KEY_ID,
+        "iss": "cdp",
+        "aud": None,
+        "nbf": now,
+        "exp": now + expires_in,
+        "uris": [uri],
+    }
+    return pyjwt.encode(claims, private_key, algorithm="EdDSA", headers=header)
+
+
+def _cdp_create_headers() -> dict[str, dict[str, str]]:
+    """Per-endpoint auth headers for the CDP facilitator (verify/settle/supported)."""
+    base_path = "/platform/v2/x402"
+    return {
+        "verify": {"Authorization": f"Bearer {_generate_cdp_jwt('POST', f'{base_path}/verify')}"},
+        "settle": {"Authorization": f"Bearer {_generate_cdp_jwt('POST', f'{base_path}/settle')}"},
+        "supported": {"Authorization": f"Bearer {_generate_cdp_jwt('GET', f'{base_path}/supported')}"},
+    }
+
+
+if CDP_API_KEY_ID and CDP_API_KEY_SECRET:
+    # Mainnet (and CDP-backed testnet): authenticated Coinbase facilitator.
+    facilitator_config = FacilitatorConfig(
+        url=CDP_FACILITATOR_URL,
+        auth_provider=CreateHeadersAuthProvider(_cdp_create_headers),
+    )
+else:
+    # No CDP credentials set — fall back to the open, unauthenticated
+    # testnet-only facilitator (works only on Base Sepolia / Solana Devnet).
+    facilitator_config = FacilitatorConfig(url=FACILITATOR_URL)
+
+facilitator = HTTPFacilitatorClient(facilitator_config)
 server = x402ResourceServer(facilitator)
 register_exact_evm_server(server, networks=NETWORK)
 
