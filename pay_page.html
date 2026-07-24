@@ -227,20 +227,37 @@ payBtn.addEventListener("click", async () => {
     });
     const secondBody = await secondResp.text();
 
+    // The facilitator's real success/failure reason (error_reason, error_message,
+    // transaction hash, etc.) travels in the PAYMENT-RESPONSE header as base64 JSON,
+    // on BOTH success and failure responses. The response body is often just "{}" on
+    // failure, so we must decode this header to see why settlement actually failed.
+    let settleInfo = null;
+    const settleHeader = secondResp.headers.get("payment-response");
+    if (settleHeader) {
+      try {
+        settleInfo = jsonFromB64(settleHeader);
+      } catch (e) {
+        settleInfo = null;
+      }
+    }
+
     if (secondResp.status === 200) {
       append("\n✅ Payment succeeded! (status 200)\n\nResponse:\n" + secondBody);
-      const settleHeader = secondResp.headers.get("payment-response");
-      if (settleHeader) {
-        try {
-          const settleInfo = jsonFromB64(settleHeader);
-          append("\nSettlement info: " + JSON.stringify(settleInfo, null, 2));
-        } catch (e) {
-          append("\nSettlement header (raw): " + settleHeader);
-        }
+      if (settleInfo) {
+        append("\nSettlement info: " + JSON.stringify(settleInfo, null, 2));
+      } else if (settleHeader) {
+        append("\nSettlement header (raw): " + settleHeader);
       }
       statusEl.className = "ok";
     } else {
       append("\n❌ Payment did not succeed (status " + secondResp.status + "):\n" + secondBody);
+      if (settleInfo) {
+        append("\nSettlement details (from PAYMENT-RESPONSE header): " + JSON.stringify(settleInfo, null, 2));
+      } else if (settleHeader) {
+        append("\nSettlement header (raw, could not decode): " + settleHeader);
+      } else {
+        append("\n(No PAYMENT-RESPONSE header was present on this response — the facilitator gave no reason.)");
+      }
       statusEl.className = "err";
     }
   } catch (e) {
