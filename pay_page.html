@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Macro Pulse — Pay Endpoint</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         background: #0b0f14; color: #e6edf3; margin: 0; padding: 24px; }
+  .card { max-width: 480px; margin: 0 auto; background: #11161c; border: 1px solid #232b33;
+          border-radius: 16px; padding: 24px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.sub { color: #8b98a5; font-size: 14px; margin: 0 0 20px; }
+  .row { display: flex; justify-content: space-between; font-size: 13px; padding: 8px 0;
+         border-bottom: 1px solid #1c232b; color: #b6c2cd; }
+  .row span:last-child { color: #e6edf3; font-family: monospace; }
+  button { width: 100%; padding: 14px; margin-top: 16px; border: none; border-radius: 10px;
+           font-size: 15px; font-weight: 600; cursor: pointer; }
+  #connectBtn { background: #2f6fed; color: white; }
+  #payBtn { background: #16a34a; color: white; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  #status { margin-top: 18px; font-size: 13px; color: #8b98a5; white-space: pre-wrap;
+            word-break: break-word; line-height: 1.5; }
+  .ok { color: #4ade80 !important; }
+  .err { color: #f87171 !important; }
+  a { color: #6ea8fe; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Macro Pulse — Bootstrap Payment</h1>
+    <p class="sub">Pay this API's own endpoint once from your connected wallet.
+      Your private key stays inside your wallet the whole time — this page never sees it.</p>
+
+    <div class="row"><span>Endpoint</span><span>GET /macro-pulse/US</span></div>
+    <div class="row"><span>Price</span><span>$0.02 USDC</span></div>
+    <div class="row"><span>Network</span><span>Base mainnet</span></div>
+    <div class="row"><span>Pay to</span><span id="payToShort">__PAY_TO__</span></div>
+
+    <button id="connectBtn">Connect Wallet</button>
+    <button id="payBtn" disabled>Pay $0.02 &amp; Call Endpoint</button>
+
+    <div id="status">Open this page inside your wallet's built-in browser (Base app: tap the browser/Discover icon and enter this page's URL) or in a desktop browser with a wallet extension installed, then tap Connect Wallet.</div>
+  </div>
+
+<script>
+const PAY_TO = "__PAY_TO__";
+const USDC_ADDRESS = "__ASSET__";
+const BASE_CHAIN_ID_HEX = "0x2105"; // 8453
+const ENDPOINT = "/macro-pulse/US";
+
+const statusEl = document.getElementById("status");
+const connectBtn = document.getElementById("connectBtn");
+const payBtn = document.getElementById("payBtn");
+
+let account = null;
+
+function log(msg, cls) {
+  statusEl.textContent = msg;
+  statusEl.className = cls || "";
+}
+
+function append(msg) {
+  statusEl.textContent += "\n" + msg;
+}
+
+function toHex(bytes) {
+  return "0x" + Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function randomNonce() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return toHex(bytes);
+}
+
+function b64FromJson(obj) {
+  return btoa(unescape(encodeURIComponent(JSON.stringify(obj))));
+}
+
+function jsonFromB64(b64) {
+  return JSON.parse(decodeURIComponent(escape(atob(b64))));
+}
+
+async function ensureBaseNetwork() {
+  const chainId = await window.ethereum.request({ method: "eth_chainId" });
+  if (chainId === BASE_CHAIN_ID_HEX) return;
+  try {
+    await window.ethereum.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: BASE_CHAIN_ID_HEX }],
+    });
+  } catch (switchErr) {
+    if (switchErr.code === 4902) {
+      await window.ethereum.request({
+        method: "wallet_addEthereumChain",
+        params: [{
+          chainId: BASE_CHAIN_ID_HEX,
+          chainName: "Base",
+          nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+          rpcUrls: ["https://mainnet.base.org"],
+          blockExplorerUrls: ["https://basescan.org"],
+        }],
+      });
+    } else {
+      throw switchErr;
+    }
+  }
+}
+
+connectBtn.addEventListener("click", async () => {
+  if (!window.ethereum) {
+    log("No wallet found in this browser. Open this page inside the Base app's browser, or use a desktop browser with MetaMask/Coinbase Wallet installed.", "err");
+    return;
+  }
+  try {
+    log("Requesting wallet connection...");
+    const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
+    account = accounts[0];
+    await ensureBaseNetwork();
+    log("Connected: " + account + "\nNetwork: Base mainnet\n\nReady to pay.", "ok");
+    connectBtn.textContent = "Connected";
+    connectBtn.disabled = true;
+    payBtn.disabled = false;
+  } catch (e) {
+    log("Connection failed: " + (e.message || e), "err");
+  }
+});
+
+payBtn.addEventListener("click", async () => {
+  payBtn.disabled = true;
+  try {
+    log("Step 1/4 — Calling endpoint to get payment requirements...");
+    const firstResp = await fetch(ENDPOINT, { headers: { "Accept": "application/json" } });
+
+    if (firstResp.status !== 402) {
+      const body = await firstResp.text();
+      log("Endpoint did not return 402 as expected (status " + firstResp.status + "):\n" + body, "err");
+      payBtn.disabled = false;
+      return;
+    }
+
+    const requiredHeader = firstResp.headers.get("payment-required");
+    if (!requiredHeader) {
+      log("No payment-required header found on the 402 response.", "err");
+      payBtn.disabled = false;
+      return;
+    }
+    const paymentRequired = jsonFromB64(requiredHeader);
+    const requirement = paymentRequired.accepts[0];
+    append("Got payment requirements: " + requirement.amount + " units of " + requirement.asset);
+
+    log(statusEl.textContent + "\n\nStep 2/4 — Building payment authorization...");
+    const now = Math.floor(Date.now() / 1000);
+    const validAfter = "0";
+    const validBefore = String(now + (requirement.maxTimeoutSeconds || 300));
+    const nonce = randomNonce();
+    const extra = requirement.extra || {};
+    const tokenName = extra.name || "USD Coin";
+    const tokenVersion = extra.version || "2";
+
+    const typedData = {
+      types: {
+        EIP712Domain: [
+          { name: "name", type: "string" },
+          { name: "version", type: "string" },
+          { name: "chainId", type: "uint256" },
+          { name: "verifyingContract", type: "address" },
+        ],
+        TransferWithAuthorization: [
+          { name: "from", type: "address" },
+          { name: "to", type: "address" },
+          { name: "value", type: "uint256" },
+          { name: "validAfter", type: "uint256" },
+          { name: "validBefore", type: "uint256" },
+          { name: "nonce", type: "bytes32" },
+        ],
+      },
+      primaryType: "TransferWithAuthorization",
+      domain: {
+        name: tokenName,
+        version: tokenVersion,
+        chainId: 8453,
+        verifyingContract: requirement.asset,
+      },
+      message: {
+        from: account,
+        to: requirement.payTo,
+        value: requirement.amount,
+        validAfter: validAfter,
+        validBefore: validBefore,
+        nonce: nonce,
+      },
+    };
+
+    append("Step 3/4 — Please approve the signature request in your wallet...");
+    const signature = await window.ethereum.request({
+      method: "eth_signTypedData_v4",
+      params: [account, JSON.stringify(typedData)],
+    });
+    append("Signed. Submitting payment...");
+
+    const paymentPayload = {
+      x402Version: 2,
+      payload: {
+        authorization: {
+          from: account,
+          to: requirement.payTo,
+          value: requirement.amount,
+          validAfter: validAfter,
+          validBefore: validBefore,
+          nonce: nonce,
+        },
+        signature: signature,
+      },
+      accepted: requirement,
+      resource: paymentRequired.resource || null,
+    };
+    const encodedPayment = b64FromJson(paymentPayload);
+
+    log(statusEl.textContent + "\n\nStep 4/4 — Retrying request with payment attached...");
+    const secondResp = await fetch(ENDPOINT, {
+      headers: {
+        "Accept": "application/json",
+        "PAYMENT-SIGNATURE": encodedPayment,
+      },
+    });
+    const secondBody = await secondResp.text();
+
+    if (secondResp.status === 200) {
+      append("\n✅ Payment succeeded! (status 200)\n\nResponse:\n" + secondBody);
+      const settleHeader = secondResp.headers.get("payment-response");
+      if (settleHeader) {
+        try {
+          const settleInfo = jsonFromB64(settleHeader);
+          append("\nSettlement info: " + JSON.stringify(settleInfo, null, 2));
+        } catch (e) {
+          append("\nSettlement header (raw): " + settleHeader);
+        }
+      }
+      statusEl.className = "ok";
+    } else {
+      append("\n❌ Payment did not succeed (status " + secondResp.status + "):\n" + secondBody);
+      statusEl.className = "err";
+    }
+  } catch (e) {
+    append("\nError: " + (e.message || e));
+    statusEl.className = "err";
+  } finally {
+    payBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

@@ -35,6 +35,7 @@ import httpx
 import jwt as pyjwt
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from x402 import x402ResourceServer
 from x402.extensions.bazaar import OutputConfig, declare_discovery_extension
 from x402.http import CreateHeadersAuthProvider, FacilitatorConfig, HTTPFacilitatorClient
@@ -250,6 +251,22 @@ async def macro_pulse(country_code: str):
         "source": "World Bank Open Data (public domain, https://data.worldbank.org)",
         "disclaimer": "Directional context only. Not financial advice, not a buy/sell signal.",
     }
+
+
+@app.get("/pay", response_class=HTMLResponse)
+async def pay_page():
+    """Self-serve bootstrap-payment page.
+
+    Lets the wallet-owning human pay this API's own endpoint once, straight
+    from a browser-injected wallet (Base app / MetaMask), with no private
+    key ever touching this server or any script. Served from the same
+    origin as the API so the in-page fetch() calls are same-origin and need
+    no CORS configuration at all.
+    """
+    html_path = os.path.join(os.path.dirname(__file__), "pay_page.html")
+    with open(html_path, encoding="utf-8") as f:
+        html = f.read()
+    return html.replace("__PAY_TO__", PAY_TO_ADDRESS).replace("__ASSET__", ASSET_ADDRESS)
 
 
 @app.get("/")
