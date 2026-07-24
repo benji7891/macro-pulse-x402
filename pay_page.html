@@ -248,10 +248,10 @@ payBtn.addEventListener("click", async () => {
     // header's `error` field (the same header used on the very first request,
     // just re-sent with a specific error message this time).
     let requiredInfo = null;
-    const requiredHeader = secondResp.headers.get("payment-required");
-    if (requiredHeader) {
+    const retryRequiredHeader = secondResp.headers.get("payment-required");
+    if (retryRequiredHeader) {
       try {
-        requiredInfo = jsonFromB64(requiredHeader);
+        requiredInfo = jsonFromB64(retryRequiredHeader);
       } catch (e) {
         requiredInfo = null;
       }
@@ -274,8 +274,8 @@ payBtn.addEventListener("click", async () => {
       } else if (requiredInfo) {
         append("\nRejection reason (from PAYMENT-REQUIRED header): " + (requiredInfo.error || JSON.stringify(requiredInfo)));
         append("\n(No PAYMENT-RESPONSE header was present, so settlement was never attempted — this was rejected earlier, before/at verification.)");
-      } else if (requiredHeader) {
-        append("\nPAYMENT-REQUIRED header (raw, could not decode): " + requiredHeader);
+      } else if (retryRequiredHeader) {
+        append("\nPAYMENT-REQUIRED header (raw, could not decode): " + retryRequiredHeader);
       } else {
         append("\n(No PAYMENT-RESPONSE or PAYMENT-REQUIRED header was present on this response — no reason given.)");
       }
