@@ -56,7 +56,21 @@ PRICE = "$0.02"
 BATCH_PRICE = "$0.05"  # flat price for up to MAX_BATCH_COUNTRIES countries in one call
 ASSET_ADDRESS = "0x036CbD53842c5426634e7929541eC2318f3dCF7e" if NETWORK == "eip155:84532" else "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 
-app = FastAPI(title="Macro Pulse")
+app = FastAPI(
+    title="Macro Pulse",
+    description=(
+        "Pay-per-call macroeconomic indicator API for AI agents, sourced from the "
+        "World Bank (GDP growth, inflation, unemployment trend). Single-country lookups "
+        "at $0.02, and an 8-country flat-priced batch endpoint at $0.05. Settled in USDC "
+        "on Base mainnet via the x402 protocol. No signup or API key required."
+    ),
+    version="1.1.0",
+    contact={
+        "name": "Benji Ferguson",
+        "email": "benjiferguson@gmail.com",
+        "url": "https://macro-pulse-x402.onrender.com",
+    },
+)
 
 
 def _generate_cdp_jwt(method: str, path: str, expires_in: int = 120) -> str:
