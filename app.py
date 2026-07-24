@@ -576,3 +576,74 @@ async def x402_discovery_manifest():
             },
         ],
     }
+
+
+# Plain-text summary for LLM/agent frameworks that check /llms.txt before
+# deciding whether (and how) to call a service.
+_LLMS_TXT = f"""# Macro Pulse
+
+> Pay-per-call macroeconomic indicator API for AI agents. Computes a per-country
+> economic momentum score from World Bank Open Data (GDP growth, inflation,
+> unemployment trend), synthesized into one directional signal. Settled in
+> USDC on Base mainnet via the x402 protocol. No signup, no API key.
+
+## Endpoints
+
+- GET {PUBLIC_BASE_URL}/macro-pulse/{{country_code}} — {PRICE} per call.
+  ISO 3166-1 alpha-2 or alpha-3 country code (e.g. US, GB, JP, DEU).
+  Example: {PUBLIC_BASE_URL}/macro-pulse/US
+- GET {PUBLIC_BASE_URL}/macro-pulse-batch/{{country_codes}} — {BATCH_PRICE} flat,
+  up to {MAX_BATCH_COUNTRIES} comma-separated country codes in one call.
+  Example: {PUBLIC_BASE_URL}/macro-pulse-batch/US,GB,JP
+
+## Payment
+
+Both endpoints return HTTP 402 with an x402 v2 payment-required payload
+(scheme: exact, network: {NETWORK}, asset: USDC) until paid. No account or
+API key is ever required — pay per call and get the response in the same
+round trip.
+
+## Discovery manifest
+
+{PUBLIC_BASE_URL}/.well-known/x402
+
+## Disclaimer
+
+Output is directional context only (momentum_label: improving / stable /
+deteriorating), not financial advice or a trading signal.
+"""
+
+
+@app.get("/llms.txt", response_class=HTMLResponse)
+async def llms_txt():
+    return HTMLResponse(content=_LLMS_TXT, media_type="text/plain")
+
+
+# AI-plugin style manifest — some agent frameworks (ChatGPT plugins-era
+# conventions, various MCP bridges) still probe this well-known path when
+# deciding whether a domain exposes a machine-usable API.
+@app.get("/.well-known/ai-plugin.json")
+async def ai_plugin_manifest():
+    return {
+        "schema_version": "v1",
+        "name_for_human": "Macro Pulse",
+        "name_for_model": "macro_pulse",
+        "description_for_human": (
+            "Pay-per-call macroeconomic indicator API: per-country economic "
+            "momentum score from World Bank data."
+        ),
+        "description_for_model": (
+            "Use to get a quick macroeconomic momentum signal for a country "
+            "(GDP growth, inflation, unemployment trend synthesized into one "
+            "directional label) before financial analysis, market commentary, "
+            "or country-risk screening. Call GET /macro-pulse/{country_code} "
+            "for a single country, or GET /macro-pulse-batch/{country_codes} "
+            "for up to 8 at once. Both require x402 USDC payment on Base "
+            "mainnet — no API key."
+        ),
+        "auth": {"type": "none"},
+        "api": {"type": "openapi", "url": f"{PUBLIC_BASE_URL}/openapi.json"},
+        "payments": {"protocol": "x402", "manifest": f"{PUBLIC_BASE_URL}/.well-known/x402"},
+        "contact_email": "benjiferguson@gmail.com",
+        "legal_info_url": PUBLIC_BASE_URL,
+    }
