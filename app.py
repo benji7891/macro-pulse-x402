@@ -245,9 +245,27 @@ routes = {
 }
 
 
+# Build the x402 middleware function ONCE at startup, not per-request.
+# payment_middleware(routes, server) re-registers/validates the bazaar
+# extension AND (with sync_facilitator_on_start, the default) makes a
+# blocking network call to the facilitator's /supported endpoint on the
+# FIRST protected request it sees. Calling payment_middleware(...) fresh
+# inside the per-request handler (as the library's own docstring example
+# literally shows, which this code previously copied verbatim) recreates
+# that whole init-on-first-request state machine from scratch on every
+# single request -- meaning EVERY request, not just the first, pays the
+# cost of a synchronous facilitator round-trip and bazaar re-validation.
+# Under any burst of concurrent requests (bots probing the endpoint, or
+# just a couple of retries) this can starve the single free-tier worker
+# and make the whole service briefly unresponsive (observed as Cloudflare
+# 522 errors). Building it once fixes both the correctness risk and the
+# performance/availability risk.
+_x402_middleware_fn = payment_middleware(routes, server)
+
+
 @app.middleware("http")
 async def x402_middleware(request: Request, call_next):
-    return await payment_middleware(routes, server)(request, call_next)
+    return await _x402_middleware_fn(request, call_next)
 
 
 # World Bank indicator codes (free, public domain, no API key required)
