@@ -25,6 +25,7 @@ only PyJWT + cryptography, both of which are lightweight and already needed
 by the underlying x402 EVM stack.
 """
 
+import asyncio
 import base64
 import os
 import random
@@ -428,18 +429,46 @@ async def fetch_indicator(country_code: str, indicator: str) -> list[dict]:
         return cached[1]
 
     url = f"https://api.worldbank.org/v2/country/{country_code}/indicator/{indicator}"
-    params = {"format": "json", "per_page": 6, "mrnev": 6}
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(url, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-    except (httpx.HTTPError, ValueError):
-        # World Bank API is down/slow/returned bad JSON — degrade gracefully
-        # instead of bubbling up an unhandled exception (which would return a
-        # generic 500 to a client who already paid for this call). Do NOT
-        # cache this outcome, so the next request retries against the live
-        # API instead of being stuck with "no data" for the full TTL.
+    # NOTE: this must be "mrv" (most recent values), NOT "mrnev". The World
+    # Bank API rejects "mrnev" with an HTTP 400 for every country/indicator,
+    # which our error handling below silently swallowed into an empty []
+    # result -- meaning every call ever returned null indicators regardless
+    # of country. It also cost a full 10s timeout per indicator (3 indicators
+    # x up to 10s each = up to ~30s per request), which is what made the
+    # paid endpoint slow enough for normal agent client timeouts to fire
+    # before the response (and settlement) completed. Found via a paid test
+    # call from a PayAPI Market reviewer on 2026-07-29 who reported both
+    # symptoms (null data + charged-but-no-response) for a single call.
+    params = {"format": "json", "per_page": 6, "mrv": 6}
+    # World Bank's public API is occasionally flaky on an individual call --
+    # observed directly: the exact same request succeeds in well under a
+    # second on one attempt, then times out entirely on the very next one,
+    # for otherwise well-covered countries. A single retry wasn't always
+    # enough (still saw full-timeout failures for e.g. Germany), so this
+    # allows up to 3 attempts at a shorter 6s timeout each (worst case ~18s
+    # for one indicator, and since all 3 indicators already run concurrently
+    # via asyncio.gather in _compute_macro_pulse, this is also the worst
+    # case for the whole response -- not 3x that).
+    data = None
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            async with httpx.AsyncClient(timeout=6) as client:
+                resp = await client.get(url, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+            break
+        except (httpx.HTTPError, ValueError):
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(0.3)
+                continue
+    if data is None:
+        # World Bank API is down/slow/returned bad JSON on every attempt —
+        # degrade gracefully instead of bubbling up an unhandled exception
+        # (which would return a generic 500 to a client who already paid
+        # for this call). Do NOT cache this outcome, so the next request
+        # retries against the live API instead of being stuck with "no
+        # data" for the full TTL.
         return []
     if not isinstance(data, list) or len(data) < 2 or not data[1]:
         return []
@@ -465,9 +494,16 @@ COUNTRY_CODE_RE = re.compile(r"^[A-Za-z]{2,3}$")
 
 async def _compute_macro_pulse(country_code: str) -> dict:
     """Shared computation used by both the single-country and batch endpoints."""
+    # Fetch all three indicators concurrently rather than one-at-a-time.
+    # These are three independent upstream calls, so there's no reason to
+    # pay their latency sequentially (this used to compound with the
+    # mrnev/mrv bug above to produce ~30s response times on a paid route).
+    names = list(INDICATORS.keys())
+    series_list = await asyncio.gather(
+        *(fetch_indicator(country_code, INDICATORS[name]) for name in names)
+    )
     results = {}
-    for name, code in INDICATORS.items():
-        series = await fetch_indicator(country_code, code)
+    for name, series in zip(names, series_list):
         results[name] = {
             "latest_value": series[0]["value"] if series else None,
             "latest_year": series[0]["date"] if series else None,
