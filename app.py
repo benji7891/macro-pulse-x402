@@ -607,7 +607,15 @@ async def macro_pulse_batch(country_codes: str):
     # doesn't get charged for redundant work either.
     seen = set()
     unique_codes = [c for c in codes if not (c in seen or seen.add(c))]
-    countries = {c: await _compute_macro_pulse(c) for c in unique_codes}
+    # Fetch all countries concurrently, not sequentially -- indicators
+    # within a single country already run concurrently (see
+    # _compute_macro_pulse), but without this, a batch of up to
+    # MAX_BATCH_COUNTRIES countries would still stack each country's worst
+    # case behind the last, reintroducing the same charged-but-timed-out
+    # risk this whole fix was about, just on the (paid, $0.05) batch
+    # endpoint instead of the single-country one.
+    results = await asyncio.gather(*(_compute_macro_pulse(c) for c in unique_codes))
+    countries = dict(zip(unique_codes, results))
     return {
         "countries": countries,
         "count": len(countries),
