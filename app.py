@@ -34,7 +34,7 @@ import time
 import httpx
 import jwt as pyjwt
 from cryptography.hazmat.primitives.asymmetric import ed25519
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 from x402 import x402ResourceServer
 from x402.extensions.bazaar import OutputConfig, declare_discovery_extension
@@ -359,6 +359,20 @@ routes = {
     },
 }
 
+# Mirror every paid GET route as a paid HEAD route with identical accepts/
+# description/extensions. Without this, HEAD requests to a paid path don't
+# match any key in `routes`, so http_server.requires_payment() returns False
+# and the request falls through to FastAPI's router -- which returns a bare
+# 405 instead of the 402 challenge. That's a real gap: at least one other
+# x402 Bazaar-listed service operator (GitHub issue x402-foundation/x402#2207)
+# confirmed HEAD returns 402 on their service, implying some discovery/health
+# probes do send HEAD instead of GET. Keep this in sync automatically rather
+# than hand-duplicating each route entry, so future paid routes get it free.
+for _route_key in list(routes.keys()):
+    _method, _path = _route_key.split(" ", 1)
+    if _method == "GET":
+        routes[f"HEAD {_path}"] = routes[_route_key]
+
 
 # Build the x402 middleware function ONCE at startup, not per-request.
 # payment_middleware(routes, server) re-registers/validates the bazaar
@@ -492,7 +506,7 @@ async def _compute_macro_pulse(country_code: str) -> dict:
     }
 
 
-@app.get("/macro-pulse/{country_code}")
+@app.api_route("/macro-pulse/{country_code}", methods=["GET", "HEAD"])
 async def macro_pulse(country_code: str):
     if not COUNTRY_CODE_RE.match(country_code):
         raise HTTPException(
@@ -502,10 +516,31 @@ async def macro_pulse(country_code: str):
     return await _compute_macro_pulse(country_code.upper())
 
 
+# Explicit OPTIONS handlers for both paid routes. `routes` (above) has no
+# "OPTIONS ..." key, so http_server.requires_payment() is False for OPTIONS
+# and the x402 middleware passes it straight through here -- OPTIONS never
+# requires payment, matching normal HTTP/CORS semantics. Without this, any
+# cross-origin JS client (e.g. a browser-based agent, not just same-origin
+# pages like our own /pay) sending the custom X-PAYMENT header on the paid
+# retry would have its CORS preflight OPTIONS request 405, silently breaking
+# the whole payment flow before the real GET ever went out.
+_CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+    "Access-Control-Allow-Headers": "X-PAYMENT, Payment-Signature, Content-Type, Accept",
+    "Access-Control-Max-Age": "86400",
+}
+
+
+@app.options("/macro-pulse/{country_code}")
+async def macro_pulse_options(country_code: str) -> Response:
+    return Response(status_code=204, headers=_CORS_HEADERS)
+
+
 MAX_BATCH_COUNTRIES = 8
 
 
-@app.get("/macro-pulse-batch/{country_codes}")
+@app.api_route("/macro-pulse-batch/{country_codes}", methods=["GET", "HEAD"])
 async def macro_pulse_batch(country_codes: str):
     """Higher-value bundled endpoint: many countries in one paid call.
 
@@ -543,6 +578,11 @@ async def macro_pulse_batch(country_codes: str):
         "source": "World Bank Open Data (public domain, https://data.worldbank.org)",
         "disclaimer": "Directional context only. Not financial advice, not a buy/sell signal.",
     }
+
+
+@app.options("/macro-pulse-batch/{country_codes}")
+async def macro_pulse_batch_options(country_codes: str) -> Response:
+    return Response(status_code=204, headers=_CORS_HEADERS)
 
 
 @app.get("/pay", response_class=HTMLResponse)
