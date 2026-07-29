@@ -614,6 +614,12 @@ async def root():
             },
         },
         "network": NETWORK,
+        "verification": {
+            "gold402_verified": True,
+            "listing": "https://24klabs.ai/listing/macro-pulse",
+            "badge_svg": "https://24klabs.ai/badge.svg?resource=https%3A%2F%2Fmacro-pulse-x402.onrender.com",
+            "card_svg": "https://24klabs.ai/card.svg?resource=https%3A%2F%2Fmacro-pulse-x402.onrender.com",
+        },
     }
 
 
