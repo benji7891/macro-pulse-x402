@@ -130,6 +130,62 @@ facilitator = HTTPFacilitatorClient(facilitator_config)
 server = x402ResourceServer(facilitator)
 register_exact_evm_server(server, networks=NETWORK)
 
+# --- Wire-level facilitator logging -------------------------------------------
+# The x402 SDK itself already inspects the CDP facilitator's response for an
+# EXTENSION-RESPONSES header (see x402/http/facilitator_client.py,
+# _log_extension_responses_header) and, if present, logs allowlisted fields
+# (status/rejectedReason/reason/code) via Python's stdlib `logging` at INFO
+# level under the "x402" logger name. We were never actually configuring
+# stdlib logging to go anywhere, so that diagnostic signal was being silently
+# dropped. Wire it to stdout (Render captures stdout) so we can see directly
+# whether CDP is sending that header at all, and if so, what it says about
+# our bazaar extension specifically.
+import logging as _stdlib_logging
+
+_stdlib_logging.basicConfig(
+    level=_stdlib_logging.INFO,
+    format="X402_SDK_LOG %(name)s %(message)s",
+    stream=__import__("sys").stdout,
+    force=True,
+)
+_stdlib_logging.getLogger("x402").setLevel(_stdlib_logging.INFO)
+
+# Additionally, wrap facilitator.verify/settle directly so we can print the
+# exact PaymentPayload + PaymentRequirements our server forwards to CDP (the
+# actual wire payload, not just what the SDK source claims it constructs),
+# plus the full parsed VerifyResponse/SettleResponse we get back.
+_orig_facilitator_verify = facilitator.verify
+_orig_facilitator_settle = facilitator.settle
+
+
+def _dump_model(obj):
+    try:
+        return obj.model_dump(by_alias=True, exclude_none=True)
+    except Exception:
+        return repr(obj)
+
+
+async def _debug_facilitator_verify(payload, requirements):
+    print("X402_WIRE verify.request.payload =", _dump_model(payload), flush=True)
+    print("X402_WIRE verify.request.requirements =", _dump_model(requirements), flush=True)
+    result = await _orig_facilitator_verify(payload, requirements)
+    print("X402_WIRE verify.response =", _dump_model(result), flush=True)
+    return result
+
+
+async def _debug_facilitator_settle(payload, requirements):
+    print("X402_WIRE settle.request.payload =", _dump_model(payload), flush=True)
+    print("X402_WIRE settle.request.requirements =", _dump_model(requirements), flush=True)
+    result = await _orig_facilitator_settle(payload, requirements)
+    print("X402_WIRE settle.response =", _dump_model(result), flush=True)
+    return result
+
+
+facilitator.verify = _debug_facilitator_verify
+facilitator.settle = _debug_facilitator_settle
+print("X402_WIRE debug wrappers installed on facilitator client", flush=True)
+# --- End wire-level facilitator logging ---------------------------------------
+
 # --- Temporary debug logging -------------------------------------------------
 # The x402 middleware deliberately returns an empty body on failure (so payer
 # clients don't see internal details), which makes it impossible to diagnose
