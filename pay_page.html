@@ -215,6 +215,15 @@ payBtn.addEventListener("click", async () => {
       },
       accepted: requirement,
       resource: paymentRequired.resource || null,
+      // BUGFIX (2026-07-29): this hand-built payload previously never echoed
+      // back the server's declared extensions (e.g. extensions.bazaar), unlike
+      // the official x402 SDK client (x402Client / register_exact_evm_client),
+      // which merges server-declared extensions into the outgoing payload by
+      // default. That's almost certainly why settlements made through this
+      // page were never picked up by CDP's Bazaar discovery indexer, even
+      // though both prior real settlements succeeded on-chain. Echo it here
+      // so this bootstrap page matches the official client's behavior.
+      extensions: paymentRequired.extensions || undefined,
     };
     const encodedPayment = b64FromJson(paymentPayload);
 
