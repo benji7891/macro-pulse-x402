@@ -36,7 +36,7 @@ import httpx
 import jwt as pyjwt
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from x402 import x402ResourceServer
 from x402.extensions.bazaar import OutputConfig, declare_discovery_extension
 from x402.http import CreateHeadersAuthProvider, FacilitatorConfig, HTTPFacilitatorClient
@@ -392,9 +392,64 @@ for _route_key in list(routes.keys()):
 # performance/availability risk.
 _x402_middleware_fn = payment_middleware(routes, server)
 
+# Paths that carry a payment-gated path parameter -- used by the guard below
+# to scope its check to the routes that can actually receive a raw template.
+_PAID_TEMPLATE_PREFIXES = ("/macro-pulse/", "/macro-pulse-batch/")
+# Real country codes (single or comma-separated in the batch case) are always
+# plain letters -- any of these punctuation characters in the final path
+# segment can only come from an unsubstituted URL template, never a genuine
+# request.
+_TEMPLATE_PLACEHOLDER_RE = re.compile(r"[:{}\[\]]")
+
 
 @app.middleware("http")
 async def x402_middleware(request: Request, call_next):
+    # Defensive guard against literal, unsubstituted route templates.
+    #
+    # Root cause (confirmed by reading the installed x402 SDK source, not
+    # guessed): the Bazaar discovery extension (x402/extensions/bazaar/
+    # resource_service.py + server.py) requires colon-style ":param" or
+    # bracket-style "[param]" route keys -- it has no support for FastAPI's
+    # "{param}" syntax at all, and neither does payment_middleware's own
+    # path matcher (x402/http/x402_http_server_base.py:_parse_route_pattern).
+    # So the colon-style keys in `routes` above are correct and required,
+    # not a bug to "fix" by switching to curly braces.
+    #
+    # The actual leak: by SDK/spec design, the public Bazaar catalog
+    # (https://api.cdp.coinbase.com/platform/v2/x402/discovery/resources)
+    # publishes each parameterized route's "resource" field as a
+    # fully-qualified URL with that raw template baked in verbatim, e.g.
+    # "https://macro-pulse-x402.onrender.com/macro-pulse/:country_code"
+    # (verified directly against the live feed). Well-behaved agents are
+    # supposed to read the accompanying pathParams JSON Schema and
+    # substitute a real value; naive crawlers/directories just GET that
+    # literal resource string instead. This isn't something our app can
+    # suppress from Coinbase's catalog -- it's how the SDK reports every
+    # path-parameterized listing.
+    #
+    # Without this guard, those literal-template requests reach
+    # payment_middleware, whose matcher treats any non-slash path segment
+    # as a valid parameter value, so they get a generic 402 -- indistinguishable
+    # in logs/metrics from someone who actually intended to pay. Short-circuit
+    # them here with a fast, clean 400 before the paywall (and the facilitator
+    # round-trip it can trigger) ever runs.
+    path = request.url.path
+    if path.startswith(_PAID_TEMPLATE_PREFIXES):
+        last_segment = path.rsplit("/", 1)[-1]
+        if _TEMPLATE_PLACEHOLDER_RE.search(last_segment):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_path_parameter",
+                    "message": (
+                        "This looks like a raw, unsubstituted URL template rather "
+                        "than a real request. Replace the placeholder with an "
+                        "actual value, e.g. /macro-pulse/US or "
+                        "/macro-pulse-batch/US,GB,JP. See /.well-known/x402 or "
+                        "/openapi.json for the full spec."
+                    ),
+                },
+            )
     return await _x402_middleware_fn(request, call_next)
 
 
