@@ -27,21 +27,45 @@ by the underlying x402 EVM stack.
 
 import asyncio
 import base64
+import contextlib
+import json
 import os
 import random
 import re
 import time
+import urllib.parse
 
 import httpx
 import jwt as pyjwt
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import CallToolResult, TextContent
 from x402 import x402ResourceServer
-from x402.extensions.bazaar import OutputConfig, declare_discovery_extension
+from x402.extensions.bazaar import (
+    DeclareMcpDiscoveryConfig,
+    OutputConfig,
+    declare_discovery_extension,
+    declare_mcp_discovery_extension,
+)
 from x402.http import CreateHeadersAuthProvider, FacilitatorConfig, HTTPFacilitatorClient
 from x402.http.middleware.fastapi import payment_middleware
 from x402.mechanisms.evm.exact.register import register_exact_evm_server
+from x402.mcp import create_payment_wrapper
+from x402.schemas import ResourceConfig
+# x402.mcp.types.ResourceInfo is a plain class without model_dump(); the SDK's
+# own create_payment_wrapper() calls resource.model_dump(by_alias=True, ...)
+# unconditionally when building payment-required/settlement-failed results,
+# which crashes with AttributeError on every unpaid call (i.e. every real
+# call, since discovery always starts unpaid) -- confirmed still broken in
+# x402 2.16.0 through 2.19.0 (latest). x402.schemas.payments.ResourceInfo is
+# a pydantic model with the identical field set (url, description, mime_type,
+# service_name, tags, icon_url) and correct by_alias camelCase output, so we
+# use that one as a drop-in fix instead of the one create_payment_wrapper's
+# own docstring points to.
+from x402.schemas.payments import ResourceInfo
 
 # ---------------------------------------------------------------------------
 # Config — fill these in before going live
@@ -682,6 +706,225 @@ async def macro_pulse_batch(country_codes: str):
 @app.options("/macro-pulse-batch/{country_codes}")
 async def macro_pulse_batch_options(country_codes: str) -> Response:
     return Response(status_code=204, headers=_CORS_HEADERS)
+
+
+# ---------------------------------------------------------------------------
+# MCP surface -- same two paid operations, exposed as MCP tools so agent
+# frameworks that speak MCP (Claude Desktop, Cursor, any streamable-HTTP MCP
+# client) can call Macro Pulse directly instead of hand-rolling HTTP + x402.
+# Reuses the SAME x402ResourceServer instance as the REST routes above (one
+# facilitator connection, one bazaar registration, one source of truth for
+# pay-to/network/pricing) -- this is additive, not a parallel payment stack.
+#
+# Uses x402.mcp.create_payment_wrapper -- the SDK's real, documented
+# server-side FastMCP bridge (x402/mcp/server.py). This is a different
+# function from x402.mcp.server_async.wrap_fastmcp_tool(), which IS broken
+# in this SDK version (imports two helper functions that don't exist). This
+# one is self-contained: it decorates a plain async handler (business args
+# only, no ctx param needed -- the wrapper injects a synthetic `ctx: Context`
+# parameter itself so FastMCP's schema builder excludes it automatically),
+# extracts the x402 payment payload from the MCP request's `_meta`, verifies
+# it, runs the handler, settles on success, and returns a fully-formed
+# mcp.types.CallToolResult either way -- no manual result conversion needed.
+#
+# server.initialize() is normally lazy (first REST request pays the one-time
+# facilitator round-trip -- see the comment above payment_middleware(...)).
+# Building payment requirements for MCP tools happens at module load time,
+# before any request exists to trigger that lazy path, so it's forced here
+# instead. This is a pure no-op for the REST path: by the time a real
+# request arrives, server._initialized is already True, so its own lazy-init
+# check just skips re-initializing.
+server.initialize()
+
+# streamable_http_path="/" avoids double-nesting: FastMCP's own ASGI app
+# already serves its endpoint at "/mcp" by default, and mounting that whole
+# app at app.mount("/mcp", ...) below would otherwise put the real endpoint
+# at /mcp/mcp instead of /mcp.
+#
+# transport_security: FastMCP auto-enables DNS-rebinding protection with
+# allowed_hosts limited to loopback (127.0.0.1/localhost) whenever no `host`
+# is passed to the constructor -- fine for local dev, but it 421s every real
+# request once this is deployed behind Render's public hostname. Explicitly
+# allow the public host this API actually serves from (same host already
+# used for PUBLIC_BASE_URL/bazaar discovery below) instead of disabling the
+# protection outright.
+_mcp_public_host = urllib.parse.urlparse(PUBLIC_BASE_URL).hostname or "macro-pulse-x402.onrender.com"
+mcp_server = FastMCP(
+    "macro-pulse",
+    streamable_http_path="/",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[_mcp_public_host, f"{_mcp_public_host}:*"],
+    ),
+)
+
+
+def _mcp_accepts(price: str) -> list:
+    return server.build_payment_requirements(
+        ResourceConfig(scheme="exact", pay_to=PAY_TO_ADDRESS, price=price, network=NETWORK)
+    )
+
+
+_macro_pulse_paid = create_payment_wrapper(
+    server,
+    accepts=_mcp_accepts(PRICE),
+    resource=ResourceInfo(
+        url="mcp://tool/macro_pulse",
+        description=(
+            "Computed economic momentum score for a country (GDP growth, "
+            "inflation, unemployment trend synthesized into one directional "
+            "signal: improving / stable / deteriorating)."
+        ),
+        service_name="Macro Pulse",
+        tags=["macro", "economics", "worldbank", "finance"],
+    ),
+    extensions=declare_mcp_discovery_extension(
+        DeclareMcpDiscoveryConfig(
+            tool_name="macro_pulse",
+            description="Computed economic momentum score for a single country.",
+            transport="streamable-http",
+            input_schema={
+                "properties": {
+                    "country_code": {
+                        "type": "string",
+                        "description": "ISO 3166-1 alpha-2 or alpha-3 country code, e.g. US, GB, DEU",
+                    }
+                },
+                "required": ["country_code"],
+            },
+            example={"country_code": "US"},
+        )
+    ),
+)
+
+_macro_pulse_batch_paid = create_payment_wrapper(
+    server,
+    accepts=_mcp_accepts(BATCH_PRICE),
+    resource=ResourceInfo(
+        url="mcp://tool/macro_pulse_batch",
+        description=(
+            "Same momentum score as macro_pulse, for up to "
+            f"{MAX_BATCH_COUNTRIES} countries in one call. Flat price."
+        ),
+        service_name="Macro Pulse",
+        tags=["macro", "economics", "worldbank", "finance"],
+    ),
+    extensions=declare_mcp_discovery_extension(
+        DeclareMcpDiscoveryConfig(
+            tool_name="macro_pulse_batch",
+            description="Momentum scores for up to 8 countries in one flat-priced call.",
+            transport="streamable-http",
+            input_schema={
+                "properties": {
+                    "country_codes": {
+                        "type": "string",
+                        "description": "Comma-separated ISO 3166-1 codes, e.g. US,GB,JP (max 8)",
+                    }
+                },
+                "required": ["country_codes"],
+            },
+            example={"country_codes": "US,GB,JP"},
+        )
+    ),
+)
+
+
+@mcp_server.tool(
+    name="macro_pulse",
+    description=(
+        "Computed economic momentum score for a country (GDP growth, inflation, "
+        "unemployment trend synthesized into one directional signal: improving / "
+        f"stable / deteriorating). Priced at {PRICE} per call via x402 (USDC on Base)."
+    ),
+)
+@_macro_pulse_paid
+async def mcp_macro_pulse(country_code: str):
+    code = str(country_code).upper()
+    if not COUNTRY_CODE_RE.match(code):
+        return CallToolResult(
+            isError=True,
+            content=[
+                TextContent(
+                    type="text",
+                    text="country_code must be a 2 or 3 letter ISO 3166-1 code, e.g. US, GB, DEU.",
+                )
+            ],
+        )
+    return await _compute_macro_pulse(code)
+
+
+@mcp_server.tool(
+    name="macro_pulse_batch",
+    description=(
+        "Same momentum score as macro_pulse, for up to "
+        f"{MAX_BATCH_COUNTRIES} comma-separated countries in one call. Flat "
+        f"{BATCH_PRICE} price via x402 (USDC on Base), cheaper than calling "
+        "macro_pulse repeatedly."
+    ),
+)
+@_macro_pulse_batch_paid
+async def mcp_macro_pulse_batch(country_codes: str):
+    raw = str(country_codes)
+    codes = [c.strip().upper() for c in raw.split(",") if c.strip()]
+    if not codes:
+        return CallToolResult(
+            isError=True,
+            content=[TextContent(type="text", text="Provide at least one country code.")],
+        )
+    if len(codes) > MAX_BATCH_COUNTRIES:
+        return CallToolResult(
+            isError=True,
+            content=[
+                TextContent(
+                    type="text",
+                    text=f"Maximum {MAX_BATCH_COUNTRIES} countries per batch call. Got {len(codes)}.",
+                )
+            ],
+        )
+    for c in codes:
+        if not COUNTRY_CODE_RE.match(c):
+            return CallToolResult(
+                isError=True,
+                content=[
+                    TextContent(type="text", text=f"'{c}' is not a valid 2 or 3 letter ISO 3166-1 code.")
+                ],
+            )
+    seen = set()
+    unique_codes = [c for c in codes if not (c in seen or seen.add(c))]
+    results = await asyncio.gather(*(_compute_macro_pulse(c) for c in unique_codes))
+    countries = dict(zip(unique_codes, results))
+    return {
+        "countries": countries,
+        "count": len(countries),
+        "source": "World Bank Open Data (public domain, https://data.worldbank.org)",
+        "disclaimer": "Directional context only. Not financial advice, not a buy/sell signal.",
+    }
+
+
+# Mount FastMCP's own ASGI (streamable-HTTP) app at /mcp on the SAME FastAPI
+# app that serves the REST routes -- one process, one Render service, no
+# separate deploy or port.
+app.mount("/mcp", mcp_server.streamable_http_app())
+
+# FastMCP's streamable-HTTP transport needs its session manager's task group
+# started via `mcp_server.session_manager.run()` before it can handle a
+# single request -- normally that happens inside the lifespan of the
+# standalone Starlette app FastMCP builds for you. Mounting that app as a
+# sub-app does NOT propagate its lifespan automatically, so without this the
+# very first POST to /mcp fails with "Task group is not initialized." Wrap
+# the existing app lifespan (a no-op by default -- app.py sets no lifespan=
+# of its own) so the session manager starts/stops alongside the app itself.
+_existing_lifespan = app.router.lifespan_context
+
+
+@contextlib.asynccontextmanager
+async def _lifespan_with_mcp(app_: FastAPI):
+    async with mcp_server.session_manager.run():
+        async with _existing_lifespan(app_) as state:
+            yield state
+
+
+app.router.lifespan_context = _lifespan_with_mcp
 
 
 @app.get("/pay", response_class=HTMLResponse)
