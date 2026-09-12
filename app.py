@@ -47,6 +47,7 @@ from x402 import x402ResourceServer
 from x402.extensions.bazaar import (
     DeclareMcpDiscoveryConfig,
     OutputConfig,
+    bazaar_resource_server_extension,
     declare_discovery_extension,
     declare_mcp_discovery_extension,
 )
@@ -67,6 +68,8 @@ from x402.schemas import ResourceConfig
 # own docstring points to.
 from x402.schemas.payments import ResourceInfo
 
+import stripe_tier
+
 # ---------------------------------------------------------------------------
 # Config — fill these in before going live
 # ---------------------------------------------------------------------------
@@ -80,6 +83,17 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://macro-pulse-x402.on
 PRICE = "$0.02"
 BATCH_PRICE = "$0.05"  # flat price for up to MAX_BATCH_COUNTRIES countries in one call
 ASSET_ADDRESS = "0x036CbD53842c5426634e7929541eC2318f3dCF7e" if NETWORK == "eip155:84532" else "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+
+# --- Stripe card-payment tier (human developers, no crypto wallet needed) ---
+# Independent of the x402/CDP config above -- see stripe_tier.py for the
+# full flow. Configuring these is optional: if STRIPE_SECRET_KEY is unset,
+# /subscribe cleanly 503s and X-API-Key checks always fail closed, so the
+# x402 paywall behavior for everyone else is completely unaffected.
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
+STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID")
+STRIPE_PRICE_LABEL = os.environ.get("STRIPE_PRICE_LABEL", "$9/month")
+stripe_tier.configure(STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_ID, STRIPE_PRICE_LABEL)
 
 app = FastAPI(
     title="Macro Pulse",
@@ -154,6 +168,15 @@ else:
 facilitator = HTTPFacilitatorClient(facilitator_config)
 server = x402ResourceServer(facilitator)
 register_exact_evm_server(server, networks=NETWORK)
+# Without this, discovery declarations never get an HTTP `method` injected
+# into their info/schema (that injection is this extension's whole job --
+# see x402/extensions/bazaar/server.py:BazaarResourceServerExtension). The
+# resulting declarations fail the Bazaar facilitator's own schema validation
+# ("input: 'method' is a required property", visible in our startup logs),
+# which is the most likely reason Macro Pulse dropped out of the Bazaar
+# discovery catalog despite `declare_discovery_extension(...)` being present
+# on every route below.
+server.register_extension(bazaar_resource_server_extension)
 
 # --- Wire-level facilitator logging -------------------------------------------
 # The x402 SDK itself already inspects the CDP facilitator's response for an
@@ -474,6 +497,17 @@ async def x402_middleware(request: Request, call_next):
                     ),
                 },
             )
+
+        # Stripe card-payment tier: an active-subscription API key skips the
+        # x402 challenge entirely and goes straight to the real handler,
+        # same as if payment had already been verified. Checked via Stripe
+        # (with an in-process cache -- see stripe_tier.is_active_api_key),
+        # never a local secret store, and fails closed if Stripe isn't
+        # configured or the lookup errors, so this can never accidentally
+        # let an unpaid request through.
+        api_key = request.headers.get("x-api-key")
+        if api_key and await stripe_tier.is_active_api_key(api_key):
+            return await call_next(request)
     return await _x402_middleware_fn(request, call_next)
 
 
@@ -906,6 +940,10 @@ async def mcp_macro_pulse_batch(country_codes: str):
 # separate deploy or port.
 app.mount("/mcp", mcp_server.streamable_http_app())
 
+# Stripe card-payment tier routes: /subscribe, /subscribe/success,
+# /subscribe/cancelled, /stripe/webhook. See stripe_tier.py.
+app.include_router(stripe_tier.router)
+
 # FastMCP's streamable-HTTP transport needs its session manager's task group
 # started via `mcp_server.session_manager.run()` before it can handle a
 # single request -- normally that happens inside the lifespan of the
@@ -943,8 +981,7 @@ async def pay_page():
     return html.replace("__PAY_TO__", PAY_TO_ADDRESS).replace("__ASSET__", ASSET_ADDRESS)
 
 
-@app.get("/")
-async def root():
+def _root_json_payload():
     return {
         "service": "Macro Pulse",
         "endpoints": {
@@ -962,7 +999,136 @@ async def root():
             "badge_svg": "https://24klabs.ai/badge.svg?resource=https%3A%2F%2Fmacro-pulse-x402.onrender.com",
             "card_svg": "https://24klabs.ai/card.svg?resource=https%3A%2F%2Fmacro-pulse-x402.onrender.com",
         },
+        "card_payment_tier": {
+            "description": (
+                "Prefer a monthly card subscription instead of per-call USDC? "
+                "Subscribe once, get an API key, pass it as the X-API-Key "
+                "header on any endpoint above to skip the x402 paywall."
+            ),
+            "price": STRIPE_PRICE_LABEL,
+            "subscribe_url": f"{PUBLIC_BASE_URL}/subscribe",
+            "enabled": bool(STRIPE_SECRET_KEY and STRIPE_PRICE_ID),
+        },
     }
+
+
+# Human-readable landing page. Agents/directories/curl (no "text/html" in
+# Accept) keep getting the JSON manifest below -- only browsers see this.
+_LANDING_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Macro Pulse — economic momentum signal API</title>
+<style>
+  :root {
+    --bg: #0b0d12; --panel: #12151c; --border: #23272f; --text: #e7e9ee;
+    --muted: #8b93a1; --accent: #5ee6a8; --accent2: #6ea8fe; --mono: "SF Mono", Consolas, Menlo, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.6; padding: 0 1.25rem 4rem;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  header { padding: 3.5rem 0 1.5rem; }
+  h1 { font-size: 1.9rem; font-weight: 700; letter-spacing: -0.02em; }
+  .tag { color: var(--muted); font-size: 1.05rem; margin-top: 0.6rem; max-width: 620px; }
+  .badges { display: flex; gap: 0.5rem; margin-top: 1rem; flex-wrap: wrap; }
+  .badge { font-size: 0.78rem; padding: 0.25rem 0.6rem; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); }
+  section { margin-top: 2.25rem; }
+  h2 { font-size: 1.05rem; font-weight: 600; margin-bottom: 0.75rem; color: var(--accent2); }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 1.1rem 1.25rem; }
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 0.9rem; }
+  @media (max-width: 620px) { .cards { grid-template-columns: 1fr; } }
+  .price { font-size: 1.4rem; font-weight: 700; color: var(--accent); }
+  .card p { color: var(--muted); font-size: 0.92rem; margin: 0.4rem 0 0.85rem; }
+  pre {
+    background: #05060a; border: 1px solid var(--border); border-radius: 8px; padding: 0.9rem 1rem;
+    overflow-x: auto; font-family: var(--mono); font-size: 0.82rem; color: #cfe9dc; white-space: pre-wrap; word-break: break-all;
+  }
+  a.btn {
+    display: inline-block; background: var(--accent); color: #05060a; font-weight: 600; font-size: 0.88rem;
+    padding: 0.55rem 1rem; border-radius: 7px; text-decoration: none;
+  }
+  a.link { color: var(--accent2); text-decoration: none; }
+  a.link:hover { text-decoration: underline; }
+  .links { display: flex; flex-wrap: wrap; gap: 1.1rem; font-size: 0.9rem; }
+  footer { margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.82rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Macro Pulse</h1>
+    <p class="tag">A tiny API that turns World Bank data into one directional signal per country — GDP growth, inflation, and unemployment trend synthesized into <strong>improving / stable / deteriorating</strong>. Built for AI agents to pay per call, or humans to grab a key and use it directly.</p>
+    <div class="badges">
+      <span class="badge">x402 pay-per-call</span>
+      <span class="badge">MCP-compatible</span>
+      <span class="badge">Base (USDC)</span>
+      <span class="badge">Gold402 verified</span>
+    </div>
+  </header>
+
+  <section>
+    <h2>Try it right now</h2>
+    <pre>curl __PUBLIC_BASE_URL__/macro-pulse/US</pre>
+    <p style="color:var(--muted); font-size:0.88rem; margin-top:0.5rem;">Returns a 402 with payment instructions — pay __PRICE__ in USDC on Base, or use a card subscription below, and retry.</p>
+  </section>
+
+  <section>
+    <h2>Two ways to pay</h2>
+    <div class="cards">
+      <div class="card">
+        <div class="price">__PRICE__ / call</div>
+        <p>Pay per request in USDC on Base via the <a class="link" href="https://x402.org" target="_blank">x402</a> protocol. No account, no subscription — just sign and pay. Batch lookups (up to __MAX_BATCH_COUNTRIES__ countries) are a flat __BATCH_PRICE__.</p>
+        <a class="link" href="/.well-known/x402">/.well-known/x402 manifest →</a>
+      </div>
+      <div class="card">
+        <div class="price">__STRIPE_PRICE_LABEL__</div>
+        <p>Prefer a card? Subscribe once, get an API key back immediately, and pass it as <code>X-API-Key</code> to skip the x402 paywall entirely.</p>
+        <a class="btn" href="/subscribe">Subscribe →</a>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>For agents &amp; MCP clients</h2>
+    <p style="color:var(--muted); font-size:0.9rem;">Macro Pulse is also exposed as an MCP server for agent frameworks that discover and pay for tools automatically.</p>
+    <pre>__PUBLIC_BASE_URL__/mcp/</pre>
+  </section>
+
+  <section>
+    <h2>Links</h2>
+    <div class="links">
+      <a class="link" href="/llms.txt">/llms.txt</a>
+      <a class="link" href="/.well-known/x402">x402 manifest</a>
+      <a class="link" href="https://github.com/benji7891/macro-pulse-x402" target="_blank">Source on GitHub</a>
+      <a class="link" href="https://24klabs.ai/listing/macro-pulse" target="_blank">Gold402 listing</a>
+    </div>
+  </section>
+
+  <footer>Macro Pulse runs on Base mainnet via the x402 protocol. Data derived from World Bank indicators, recomputed on each call.</footer>
+</div>
+</body>
+</html>"""
+
+_LANDING_PAGE_HTML = (
+    _LANDING_PAGE_HTML
+    .replace("__PUBLIC_BASE_URL__", PUBLIC_BASE_URL)
+    .replace("__PRICE__", PRICE)
+    .replace("__BATCH_PRICE__", BATCH_PRICE)
+    .replace("__MAX_BATCH_COUNTRIES__", str(MAX_BATCH_COUNTRIES))
+    .replace("__STRIPE_PRICE_LABEL__", STRIPE_PRICE_LABEL)
+)
+
+
+@app.get("/")
+async def root(request: Request):
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept.lower():
+        return HTMLResponse(content=_LANDING_PAGE_HTML)
+    return _root_json_payload()
 
 
 # Machine-readable discovery manifest — lets x402 directories (x402scan,
@@ -1046,6 +1212,11 @@ Both endpoints return HTTP 402 with an x402 v2 payment-required payload
 (scheme: exact, network: {NETWORK}, asset: USDC) until paid. No account or
 API key is ever required — pay per call and get the response in the same
 round trip.
+
+Prefer a monthly card subscription instead of per-call USDC? Subscribe at
+{PUBLIC_BASE_URL}/subscribe ({STRIPE_PRICE_LABEL}) and pass the API key you
+receive as an `X-API-Key` header on either endpoint above to skip the x402
+paywall entirely while your subscription is active.
 
 ## Discovery manifest
 
