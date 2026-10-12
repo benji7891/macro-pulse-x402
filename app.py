@@ -3,7 +3,11 @@ Macro Pulse — an x402-paid API that gives AI agents a computed
 "economic momentum score" per country, built entirely on free,
 public-domain World Bank data (no licensed/paid feeds involved).
 
-Endpoint: GET /macro-pulse/{country_code}   price: $0.02 per call
+ENDPOINTS:
+  GET /macro-pulse/{country_code}         $0.02 per call (basic)
+  GET /macro-pulse-batch/{country_codes}  $0.05 flat (up to 8 countries)
+  GET /macro-pulse-premium/{country_code} $0.04 per call (enhanced analysis)
+  GET /macro-pulse/preview/{country_code} FREE (US, GB, DE only - demo)
 
 Before going live on mainnet you need to set these environment variables:
   PAY_TO_ADDRESS      -> your own Base wallet address (0x...) that will receive USDC
@@ -48,9 +52,32 @@ from x402.extensions.bazaar import (
     DeclareMcpDiscoveryConfig,
     OutputConfig,
     bazaar_resource_server_extension,
-    declare_discovery_extension,
+    declare_discovery_extension as _declare_discovery_extension,
     declare_mcp_discovery_extension,
 )
+
+
+def declare_discovery_extension_with_method(
+    method: str,
+    path_params_schema: dict | None = None,
+    output: OutputConfig | None = None,
+    **kwargs
+) -> dict:
+    """Wrapper around declare_discovery_extension that injects method into info.input.
+    
+    The x402 SDK's declare_discovery_extension creates a schema requiring 'method' in
+    info.input, but doesn't populate it - that's supposed to happen at runtime via
+    bazaar_resource_server_extension. However, validation happens before that injection,
+    causing "input: 'method' is a required property" warnings. This wrapper manually
+    adds the method field to avoid validation failures and ensure proper Bazaar indexing.
+    """
+    ext = _declare_discovery_extension(
+        path_params_schema=path_params_schema,
+        output=output,
+        **kwargs
+    )
+    ext["bazaar"]["info"]["input"]["method"] = method
+    return ext
 from x402.http import CreateHeadersAuthProvider, FacilitatorConfig, HTTPFacilitatorClient
 from x402.http.middleware.fastapi import payment_middleware
 from x402.mechanisms.evm.exact.register import register_exact_evm_server
@@ -82,7 +109,11 @@ CDP_FACILITATOR_URL = "https://api.cdp.coinbase.com/platform/v2/x402"
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://macro-pulse-x402.onrender.com")
 PRICE = "$0.02"
 BATCH_PRICE = "$0.05"  # flat price for up to MAX_BATCH_COUNTRIES countries in one call
+PREMIUM_PRICE = "$0.04"  # enhanced analysis with recession risk, leading indicators, interpretation
 ASSET_ADDRESS = "0x036CbD53842c5426634e7929541eC2318f3dCF7e" if NETWORK == "eip155:84532" else "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+
+# Countries available for free preview (demo before paying)
+PREVIEW_COUNTRIES = {"US", "GB", "DE"}
 
 # --- Stripe card-payment tier (human developers, no crypto wallet needed) ---
 # Independent of the x402/CDP config above -- see stripe_tier.py for the
@@ -335,7 +366,8 @@ routes = {
         # will index it using this description/schema/example so agents can
         # find and evaluate it programmatically. The payment_middleware below
         # auto-registers the bazaar extension because this key is present.
-        "extensions": declare_discovery_extension(
+        "extensions": declare_discovery_extension_with_method(
+            method="GET",
             path_params_schema={
                 "properties": {
                     "country_code": {
@@ -374,7 +406,8 @@ routes = {
             "regardless of country count -- cheaper than calling the single-country "
             "endpoint repeatedly."
         ),
-        "extensions": declare_discovery_extension(
+        "extensions": declare_discovery_extension_with_method(
+            method="GET",
             path_params_schema={
                 "properties": {
                     "country_codes": {
@@ -401,6 +434,65 @@ routes = {
                     "count": 2,
                     "source": "World Bank Open Data (public domain, https://data.worldbank.org)",
                     "disclaimer": "Directional context only. Not financial advice, not a buy/sell signal.",
+                }
+            ),
+        ),
+    },
+    "GET /macro-pulse-premium/:country_code": {
+        "accepts": {
+            "scheme": "exact",
+            "payTo": PAY_TO_ADDRESS,
+            "price": PREMIUM_PRICE,
+            "network": NETWORK,
+        },
+        "description": (
+            "PREMIUM: Enhanced economic analysis with recession risk scoring, "
+            "extended indicators (trade balance, savings, debt, industrial output, FDI), "
+            "plain-language interpretation, and data freshness metadata. "
+            "Includes everything in /macro-pulse plus computed recession risk (0-1 scale), "
+            "risk level (low/moderate/elevated/high), and actionable signal summary."
+        ),
+        "extensions": declare_discovery_extension_with_method(
+            method="GET",
+            path_params_schema={
+                "properties": {
+                    "country_code": {
+                        "type": "string",
+                        "description": "ISO 3166-1 alpha-2 or alpha-3 country code, e.g. US, GB, JP, DEU",
+                    }
+                },
+                "required": ["country_code"],
+            },
+            output=OutputConfig(
+                example={
+                    "country": "US",
+                    "momentum_score": 0.87,
+                    "momentum_label": "improving",
+                    "recession_risk": {
+                        "score": 0.15,
+                        "level": "low",
+                        "interpretation": "No significant recession warning signals detected.",
+                    },
+                    "indicators": {
+                        "core": {
+                            "gdp_growth": {"latest_value": 2.8, "latest_year": "2024", "trend_momentum": 0.6},
+                            "inflation": {"latest_value": 2.9, "latest_year": "2024", "trend_momentum": -1.1},
+                            "unemployment": {"latest_value": 4.1, "latest_year": "2024", "trend_momentum": -0.2},
+                        },
+                        "extended": {
+                            "trade_balance": {"latest_value": -3.2, "latest_year": "2024", "trend_momentum": 0.1},
+                            "gross_savings": {"latest_value": 18.5, "latest_year": "2024", "trend_momentum": 0.3},
+                            "gov_debt": {"latest_value": 122.3, "latest_year": "2024", "trend_momentum": 1.2},
+                        },
+                    },
+                    "data_freshness": {
+                        "most_recent_year": 2024,
+                        "oldest_year": 2022,
+                        "note": "World Bank data is typically 1-2 years behind current year.",
+                    },
+                    "signal_summary": "Economy showing positive momentum with modest growth (2.8%).",
+                    "source": "World Bank Open Data (public domain, https://data.worldbank.org)",
+                    "disclaimer": "For informational purposes only. Not financial advice.",
                 }
             ),
         ),
@@ -441,16 +533,25 @@ _x402_middleware_fn = payment_middleware(routes, server)
 
 # Paths that carry a payment-gated path parameter -- used by the guard below
 # to scope its check to the routes that can actually receive a raw template.
-_PAID_TEMPLATE_PREFIXES = ("/macro-pulse/", "/macro-pulse-batch/")
+_PAID_TEMPLATE_PREFIXES = ("/macro-pulse/", "/macro-pulse-batch/", "/macro-pulse-premium/")
 # Real country codes (single or comma-separated in the batch case) are always
 # plain letters -- any of these punctuation characters in the final path
 # segment can only come from an unsubstituted URL template, never a genuine
 # request.
 _TEMPLATE_PLACEHOLDER_RE = re.compile(r"[:{}\[\]]")
 
+# Free preview endpoint path - no payment required
+_FREE_PREVIEW_PREFIX = "/macro-pulse/preview/"
+
 
 @app.middleware("http")
 async def x402_middleware(request: Request, call_next):
+    path = request.url.path
+    
+    # Free preview endpoint - no payment required
+    if path.startswith(_FREE_PREVIEW_PREFIX):
+        return await call_next(request)
+    
     # Defensive guard against literal, unsubstituted route templates.
     #
     # Root cause (confirmed by reading the installed x402 SDK source, not
@@ -480,7 +581,6 @@ async def x402_middleware(request: Request, call_next):
     # in logs/metrics from someone who actually intended to pay. Short-circuit
     # them here with a fast, clean 400 before the paywall (and the facilitator
     # round-trip it can trigger) ever runs.
-    path = request.url.path
     if path.startswith(_PAID_TEMPLATE_PREFIXES):
         last_segment = path.rsplit("/", 1)[-1]
         if _TEMPLATE_PLACEHOLDER_RE.search(last_segment):
@@ -516,6 +616,17 @@ INDICATORS = {
     "gdp_growth": "NY.GDP.MKTP.KD.ZG",
     "inflation": "FP.CPI.TOTL.ZG",
     "unemployment": "SL.UEM.TOTL.ZS",
+}
+
+# Enhanced indicators for premium endpoint (more data points = better recession risk signal)
+PREMIUM_INDICATORS = {
+    **INDICATORS,
+    "current_account_balance": "BN.CAB.XOKA.GD.ZS",  # Current account balance (% of GDP)
+    "trade_balance": "NE.RSB.GNFS.ZS",  # External balance on goods and services (% of GDP)
+    "gross_savings": "NY.GNS.ICTR.ZS",  # Gross savings (% of GDP)
+    "gov_debt": "GC.DOD.TOTL.GD.ZS",  # Central gov debt, total (% of GDP)
+    "industrial_production": "NV.IND.TOTL.KD.ZG",  # Industry (including construction), value added (% growth)
+    "fdi_inflows": "BX.KLT.DINV.WD.GD.ZS",  # Foreign direct investment, net inflows (% of GDP)
 }
 
 
@@ -655,6 +766,178 @@ async def _compute_macro_pulse(country_code: str) -> dict:
     }
 
 
+def _compute_recession_risk(indicators: dict) -> tuple[float | None, str, str]:
+    """Compute recession risk score from multiple economic indicators.
+    
+    Returns (risk_score, risk_level, interpretation) where:
+    - risk_score: 0.0 (very low) to 1.0 (very high), or None if insufficient data
+    - risk_level: "low", "moderate", "elevated", "high", or "insufficient_data"
+    - interpretation: Plain-language explanation of the signal
+    """
+    risk_signals = []
+    
+    gdp = indicators.get("gdp_growth", {})
+    gdp_val = gdp.get("latest_value")
+    gdp_momentum = gdp.get("trend_momentum")
+    if gdp_val is not None:
+        if gdp_val < 0:
+            risk_signals.append(("gdp_negative", 0.4, "negative GDP growth"))
+        elif gdp_val < 1.0:
+            risk_signals.append(("gdp_weak", 0.2, "weak GDP growth (<1%)"))
+        if gdp_momentum is not None and gdp_momentum < -1.0:
+            risk_signals.append(("gdp_falling", 0.25, "declining GDP momentum"))
+    
+    unemp = indicators.get("unemployment", {})
+    unemp_val = unemp.get("latest_value")
+    unemp_momentum = unemp.get("trend_momentum")
+    if unemp_val is not None:
+        if unemp_val > 8.0:
+            risk_signals.append(("unemp_high", 0.25, "high unemployment (>8%)"))
+        if unemp_momentum is not None and unemp_momentum > 1.0:
+            risk_signals.append(("unemp_rising", 0.2, "rising unemployment trend"))
+    
+    inflation = indicators.get("inflation", {})
+    infl_val = inflation.get("latest_value")
+    if infl_val is not None:
+        if infl_val > 6.0:
+            risk_signals.append(("infl_high", 0.15, "high inflation (>6%)"))
+        elif infl_val < 0:
+            risk_signals.append(("deflation", 0.2, "deflation (negative CPI)"))
+    
+    trade = indicators.get("trade_balance", {})
+    trade_val = trade.get("latest_value")
+    if trade_val is not None and trade_val < -5.0:
+        risk_signals.append(("trade_deficit", 0.1, "large trade deficit"))
+    
+    savings = indicators.get("gross_savings", {})
+    savings_val = savings.get("latest_value")
+    if savings_val is not None and savings_val < 15.0:
+        risk_signals.append(("low_savings", 0.1, "low savings rate"))
+    
+    debt = indicators.get("gov_debt", {})
+    debt_val = debt.get("latest_value")
+    if debt_val is not None and debt_val > 80.0:
+        risk_signals.append(("high_debt", 0.15, "high government debt (>80% GDP)"))
+    
+    industrial = indicators.get("industrial_production", {})
+    ind_val = industrial.get("latest_value")
+    ind_momentum = industrial.get("trend_momentum")
+    if ind_val is not None and ind_val < 0:
+        risk_signals.append(("ind_contraction", 0.2, "industrial contraction"))
+    if ind_momentum is not None and ind_momentum < -2.0:
+        risk_signals.append(("ind_falling", 0.15, "falling industrial output"))
+    
+    if not risk_signals:
+        if any(indicators.get(k, {}).get("latest_value") is not None 
+               for k in ["gdp_growth", "unemployment", "inflation"]):
+            return 0.15, "low", "No significant recession warning signals detected."
+        return None, "insufficient_data", "Insufficient data to assess recession risk."
+    
+    risk_score = min(1.0, sum(s[1] for s in risk_signals))
+    active_signals = [s[2] for s in risk_signals]
+    
+    if risk_score >= 0.6:
+        level = "high"
+        interp = f"Multiple recession warning signs: {', '.join(active_signals)}. Economic conditions suggest elevated downturn risk."
+    elif risk_score >= 0.35:
+        level = "elevated"
+        interp = f"Some concerning signals: {', '.join(active_signals)}. Monitor closely for deterioration."
+    elif risk_score >= 0.2:
+        level = "moderate"
+        interp = f"Minor warning signs: {', '.join(active_signals)}. Overall conditions remain manageable."
+    else:
+        level = "low"
+        interp = "Economic indicators suggest stable conditions with minimal recession risk."
+    
+    return round(risk_score, 2), level, interp
+
+
+async def _compute_premium_pulse(country_code: str) -> dict:
+    """Enhanced analysis with recession risk, more indicators, and interpretation."""
+    names = list(PREMIUM_INDICATORS.keys())
+    series_list = await asyncio.gather(
+        *(fetch_indicator(country_code, PREMIUM_INDICATORS[name]) for name in names)
+    )
+    
+    results = {}
+    data_dates = []
+    for name, series in zip(names, series_list):
+        latest_val = series[0]["value"] if series else None
+        latest_year = series[0]["date"] if series else None
+        results[name] = {
+            "latest_value": latest_val,
+            "latest_year": latest_year,
+            "trend_momentum": compute_momentum(series),
+        }
+        if latest_year:
+            data_dates.append(int(latest_year))
+    
+    base_result = await _compute_macro_pulse(country_code)
+    
+    recession_risk, risk_level, interpretation = _compute_recession_risk(results)
+    
+    most_recent_data = max(data_dates) if data_dates else None
+    oldest_data = min(data_dates) if data_dates else None
+    
+    return {
+        "country": country_code,
+        "momentum_score": base_result["momentum_score"],
+        "momentum_label": base_result["momentum_label"],
+        "recession_risk": {
+            "score": recession_risk,
+            "level": risk_level,
+            "interpretation": interpretation,
+        },
+        "indicators": {
+            "core": base_result["indicators"],
+            "extended": {k: v for k, v in results.items() if k not in INDICATORS},
+        },
+        "data_freshness": {
+            "most_recent_year": most_recent_data,
+            "oldest_year": oldest_data,
+            "note": "World Bank data is typically 1-2 years behind current year.",
+        },
+        "signal_summary": _generate_signal_summary(
+            base_result["momentum_label"], 
+            risk_level, 
+            results
+        ),
+        "source": "World Bank Open Data (public domain, https://data.worldbank.org)",
+        "disclaimer": "For informational purposes only. Not financial advice.",
+    }
+
+
+def _generate_signal_summary(momentum: str, risk_level: str, indicators: dict) -> str:
+    """Generate a concise, actionable signal summary."""
+    gdp_val = indicators.get("gdp_growth", {}).get("latest_value")
+    infl_val = indicators.get("inflation", {}).get("latest_value")
+    unemp_val = indicators.get("unemployment", {}).get("latest_value")
+    
+    parts = []
+    
+    if momentum == "improving":
+        parts.append("Economy showing positive momentum")
+    elif momentum == "deteriorating":
+        parts.append("Economy showing negative momentum")
+    else:
+        parts.append("Economy relatively stable")
+    
+    if gdp_val is not None:
+        if gdp_val > 3:
+            parts.append(f"with strong growth ({gdp_val:.1f}%)")
+        elif gdp_val > 0:
+            parts.append(f"with modest growth ({gdp_val:.1f}%)")
+        else:
+            parts.append(f"with contraction ({gdp_val:.1f}%)")
+    
+    if risk_level == "high":
+        parts.append("-- ELEVATED RECESSION RISK")
+    elif risk_level == "elevated":
+        parts.append("-- recession risk worth monitoring")
+    
+    return ". ".join([" ".join(parts[:2])] + parts[2:]) + "."
+
+
 @app.api_route("/macro-pulse/{country_code}", methods=["GET", "HEAD"])
 async def macro_pulse(country_code: str):
     if not COUNTRY_CODE_RE.match(country_code):
@@ -663,6 +946,63 @@ async def macro_pulse(country_code: str):
             detail="country_code must be a 2 or 3 letter ISO 3166-1 code, e.g. US, GB, DEU.",
         )
     return await _compute_macro_pulse(country_code.upper())
+
+
+@app.get("/macro-pulse/preview/{country_code}")
+async def macro_pulse_preview(country_code: str):
+    """FREE preview endpoint for demo countries (US, GB, DE).
+    
+    Lets agents and humans evaluate the API output before paying.
+    Returns the same data format as the paid endpoint, no payment required.
+    """
+    code = country_code.upper()
+    if not COUNTRY_CODE_RE.match(code):
+        raise HTTPException(
+            status_code=400,
+            detail="country_code must be a 2 or 3 letter ISO 3166-1 code.",
+        )
+    if code not in PREVIEW_COUNTRIES:
+        available = ", ".join(sorted(PREVIEW_COUNTRIES))
+        raise HTTPException(
+            status_code=402,
+            detail=f"Free preview is only available for: {available}. "
+                   f"For {code}, use the paid endpoint /macro-pulse/{code} ($0.02) "
+                   f"or /macro-pulse-premium/{code} ($0.04).",
+        )
+    result = await _compute_macro_pulse(code)
+    result["_preview"] = {
+        "note": "This is a free preview. Same data is available for all countries via the paid endpoints.",
+        "paid_endpoints": {
+            "basic": f"/macro-pulse/{code} ($0.02)",
+            "premium": f"/macro-pulse-premium/{code} ($0.04, includes recession risk analysis)",
+            "batch": "/macro-pulse-batch/{codes} ($0.05 flat for up to 8 countries)",
+        },
+    }
+    return result
+
+
+@app.api_route("/macro-pulse-premium/{country_code}", methods=["GET", "HEAD"])
+async def macro_pulse_premium(country_code: str):
+    """Premium endpoint with enhanced analysis, recession risk scoring, and interpretation.
+    
+    Includes:
+    - All basic indicators (GDP growth, inflation, unemployment)
+    - Extended indicators (trade balance, savings rate, gov debt, industrial output, FDI)
+    - Computed recession risk score (0.0-1.0 scale)
+    - Plain-language interpretation and signal summary
+    - Data freshness metadata
+    """
+    if not COUNTRY_CODE_RE.match(country_code):
+        raise HTTPException(
+            status_code=400,
+            detail="country_code must be a 2 or 3 letter ISO 3166-1 code, e.g. US, GB, DEU.",
+        )
+    return await _compute_premium_pulse(country_code.upper())
+
+
+@app.options("/macro-pulse-premium/{country_code}")
+async def macro_pulse_premium_options(country_code: str) -> Response:
+    return Response(status_code=204, headers=_CORS_HEADERS)
 
 
 # Explicit OPTIONS handlers for both paid routes. `routes` (above) has no
@@ -982,13 +1322,33 @@ async def pay_page():
 
 
 def _root_json_payload():
+    preview_list = ", ".join(sorted(PREVIEW_COUNTRIES))
     return {
         "service": "Macro Pulse",
+        "description": (
+            "Pay-per-call economic analysis API for AI agents. "
+            "Get momentum scores, recession risk, and actionable signals."
+        ),
         "endpoints": {
-            "/macro-pulse/{country_code}": {"price": PRICE, "example": "/macro-pulse/US"},
+            "/macro-pulse/preview/{country_code}": {
+                "price": "FREE",
+                "description": f"Try before paying. Available for: {preview_list}",
+                "example": "/macro-pulse/preview/US",
+            },
+            "/macro-pulse/{country_code}": {
+                "price": PRICE,
+                "description": "Basic momentum score (GDP, inflation, unemployment)",
+                "example": "/macro-pulse/JP",
+            },
+            "/macro-pulse-premium/{country_code}": {
+                "price": PREMIUM_PRICE,
+                "description": "Enhanced analysis with recession risk score, extended indicators, interpretation",
+                "example": "/macro-pulse-premium/US",
+            },
             "/macro-pulse-batch/{country_codes}": {
                 "price": BATCH_PRICE,
-                "example": "/macro-pulse-batch/US,GB,JP",
+                "description": "Multi-country batch (up to 8), flat price",
+                "example": "/macro-pulse-batch/US,GB,JP,DE",
                 "max_countries": MAX_BATCH_COUNTRIES,
             },
         },
@@ -1019,30 +1379,34 @@ _LANDING_PAGE_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Macro Pulse — economic momentum signal API</title>
+<title>Macro Pulse — economic momentum &amp; recession risk API</title>
 <style>
   :root {
     --bg: #0b0d12; --panel: #12151c; --border: #23272f; --text: #e7e9ee;
-    --muted: #8b93a1; --accent: #5ee6a8; --accent2: #6ea8fe; --mono: "SF Mono", Consolas, Menlo, monospace;
+    --muted: #8b93a1; --accent: #5ee6a8; --accent2: #6ea8fe; --accent3: #f5a623; --mono: "SF Mono", Consolas, Menlo, monospace;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
     line-height: 1.6; padding: 0 1.25rem 4rem;
   }
-  .wrap { max-width: 760px; margin: 0 auto; }
+  .wrap { max-width: 800px; margin: 0 auto; }
   header { padding: 3.5rem 0 1.5rem; }
   h1 { font-size: 1.9rem; font-weight: 700; letter-spacing: -0.02em; }
   .tag { color: var(--muted); font-size: 1.05rem; margin-top: 0.6rem; max-width: 620px; }
   .badges { display: flex; gap: 0.5rem; margin-top: 1rem; flex-wrap: wrap; }
   .badge { font-size: 0.78rem; padding: 0.25rem 0.6rem; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); }
+  .badge.free { border-color: var(--accent); color: var(--accent); }
   section { margin-top: 2.25rem; }
   h2 { font-size: 1.05rem; font-weight: 600; margin-bottom: 0.75rem; color: var(--accent2); }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 1.1rem 1.25rem; }
   .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 0.9rem; }
-  @media (max-width: 620px) { .cards { grid-template-columns: 1fr; } }
+  .cards3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.9rem; }
+  @media (max-width: 720px) { .cards3 { grid-template-columns: 1fr; } .cards { grid-template-columns: 1fr; } }
   .price { font-size: 1.4rem; font-weight: 700; color: var(--accent); }
-  .card p { color: var(--muted); font-size: 0.92rem; margin: 0.4rem 0 0.85rem; }
+  .price.premium { color: var(--accent3); }
+  .card p { color: var(--muted); font-size: 0.88rem; margin: 0.4rem 0 0.85rem; }
+  .card ul { color: var(--muted); font-size: 0.85rem; margin: 0.4rem 0 0.85rem; padding-left: 1.2rem; }
   pre {
     background: #05060a; border: 1px solid var(--border); border-radius: 8px; padding: 0.9rem 1rem;
     overflow-x: auto; font-family: var(--mono); font-size: 0.82rem; color: #cfe9dc; white-space: pre-wrap; word-break: break-all;
@@ -1061,8 +1425,9 @@ _LANDING_PAGE_HTML = """<!DOCTYPE html>
 <div class="wrap">
   <header>
     <h1>Macro Pulse</h1>
-    <p class="tag">A tiny API that turns World Bank data into one directional signal per country — GDP growth, inflation, and unemployment trend synthesized into <strong>improving / stable / deteriorating</strong>. Built for AI agents to pay per call, or humans to grab a key and use it directly.</p>
+    <p class="tag">Economic momentum scores and recession risk analysis for AI agents. Synthesizes World Bank data into actionable signals: <strong>improving / stable / deteriorating</strong> momentum, plus recession risk levels for premium calls.</p>
     <div class="badges">
+      <span class="badge free">Free preview</span>
       <span class="badge">x402 pay-per-call</span>
       <span class="badge">MCP-compatible</span>
       <span class="badge">Base (USDC)</span>
@@ -1071,24 +1436,56 @@ _LANDING_PAGE_HTML = """<!DOCTYPE html>
   </header>
 
   <section>
-    <h2>Try it right now</h2>
-    <pre>curl __PUBLIC_BASE_URL__/macro-pulse/US</pre>
-    <p style="color:var(--muted); font-size:0.88rem; margin-top:0.5rem;">Returns a 402 with payment instructions — pay __PRICE__ in USDC on Base, or use a card subscription below, and retry.</p>
+    <h2>Try it free</h2>
+    <pre>curl __PUBLIC_BASE_URL__/macro-pulse/preview/US</pre>
+    <p style="color:var(--muted); font-size:0.88rem; margin-top:0.5rem;">Free for US, GB, DE. See the exact output format before paying anything.</p>
   </section>
 
   <section>
-    <h2>Two ways to pay</h2>
-    <div class="cards">
+    <h2>Pricing tiers</h2>
+    <div class="cards3">
       <div class="card">
         <div class="price">__PRICE__ / call</div>
-        <p>Pay per request in USDC on Base via the <a class="link" href="https://x402.org" target="_blank">x402</a> protocol. No account, no subscription — just sign and pay. Batch lookups (up to __MAX_BATCH_COUNTRIES__ countries) are a flat __BATCH_PRICE__.</p>
-        <a class="link" href="/.well-known/x402">/.well-known/x402 manifest →</a>
+        <p><strong>Basic</strong> — momentum score</p>
+        <ul>
+          <li>GDP growth + trend</li>
+          <li>Inflation + trend</li>
+          <li>Unemployment + trend</li>
+          <li>Synthesized momentum score</li>
+        </ul>
+        <code style="font-size:0.75rem;">/macro-pulse/{code}</code>
       </div>
       <div class="card">
-        <div class="price">__STRIPE_PRICE_LABEL__</div>
-        <p>Prefer a card? Subscribe once, get an API key back immediately, and pass it as <code>X-API-Key</code> to skip the x402 paywall entirely.</p>
-        <a class="btn" href="/subscribe">Subscribe →</a>
+        <div class="price premium">__PREMIUM_PRICE__ / call</div>
+        <p><strong>Premium</strong> — recession risk</p>
+        <ul>
+          <li>Everything in Basic</li>
+          <li>Recession risk (0-1 score)</li>
+          <li>Extended indicators</li>
+          <li>Signal interpretation</li>
+        </ul>
+        <code style="font-size:0.75rem;">/macro-pulse-premium/{code}</code>
       </div>
+      <div class="card">
+        <div class="price">__BATCH_PRICE__ flat</div>
+        <p><strong>Batch</strong> — up to __MAX_BATCH_COUNTRIES__ countries</p>
+        <ul>
+          <li>Basic data per country</li>
+          <li>One call, one payment</li>
+          <li>Cheaper than individual</li>
+        </ul>
+        <code style="font-size:0.75rem;">/macro-pulse-batch/{codes}</code>
+      </div>
+    </div>
+    <p style="color:var(--muted); font-size:0.85rem; margin-top:1rem;">Pay per request in USDC on Base via <a class="link" href="https://x402.org" target="_blank">x402</a> — no account, no subscription. <a class="link" href="/.well-known/x402">See manifest →</a></p>
+  </section>
+
+  <section>
+    <h2>Card subscription</h2>
+    <div class="card" style="max-width:400px;">
+      <div class="price">__STRIPE_PRICE_LABEL__</div>
+      <p>Prefer a card? Subscribe once, get an API key, pass it as <code>X-API-Key</code> to skip the x402 paywall on any endpoint.</p>
+      <a class="btn" href="/subscribe">Subscribe →</a>
     </div>
   </section>
 
@@ -1108,7 +1505,7 @@ _LANDING_PAGE_HTML = """<!DOCTYPE html>
     </div>
   </section>
 
-  <footer>Macro Pulse runs on Base mainnet via the x402 protocol. Data derived from World Bank indicators, recomputed on each call.</footer>
+  <footer>Macro Pulse runs on Base mainnet via the x402 protocol. Data derived from World Bank indicators, recomputed on each call. Not financial advice.</footer>
 </div>
 </body>
 </html>"""
@@ -1117,6 +1514,7 @@ _LANDING_PAGE_HTML = (
     _LANDING_PAGE_HTML
     .replace("__PUBLIC_BASE_URL__", PUBLIC_BASE_URL)
     .replace("__PRICE__", PRICE)
+    .replace("__PREMIUM_PRICE__", PREMIUM_PRICE)
     .replace("__BATCH_PRICE__", BATCH_PRICE)
     .replace("__MAX_BATCH_COUNTRIES__", str(MAX_BATCH_COUNTRIES))
     .replace("__STRIPE_PRICE_LABEL__", STRIPE_PRICE_LABEL)
@@ -1135,9 +1533,31 @@ async def root(request: Request):
 # x402-list, agentcash, etc.) and AI agents find this service automatically.
 @app.get("/.well-known/x402")
 async def x402_discovery_manifest():
+    preview_list = ", ".join(sorted(PREVIEW_COUNTRIES))
     return {
         "x402Version": 2,
         "resources": [
+            {
+                "resource": f"{PUBLIC_BASE_URL}/macro-pulse/preview/{{country_code}}",
+                "method": "GET",
+                "description": (
+                    f"FREE PREVIEW: Try the API before paying. Available for {preview_list} only. "
+                    "Returns the same momentum score output as the paid endpoint."
+                ),
+                "price": "$0.00",
+                "network": NETWORK,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "country_code": {
+                            "type": "string",
+                            "description": f"Demo country code (one of: {preview_list})",
+                            "enum": list(PREVIEW_COUNTRIES),
+                        }
+                    },
+                    "required": ["country_code"],
+                },
+            },
             {
                 "resource": f"{PUBLIC_BASE_URL}/macro-pulse/{{country_code}}",
                 "method": "GET",
@@ -1147,6 +1567,30 @@ async def x402_discovery_manifest():
                     "into a single directional signal (improving / stable / deteriorating)."
                 ),
                 "price": PRICE,
+                "network": NETWORK,
+                "asset": ASSET_ADDRESS,
+                "payTo": PAY_TO_ADDRESS,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "country_code": {
+                            "type": "string",
+                            "description": "ISO 3166-1 alpha-2 country code, e.g. US, GB, JP, DE",
+                        }
+                    },
+                    "required": ["country_code"],
+                },
+            },
+            {
+                "resource": f"{PUBLIC_BASE_URL}/macro-pulse-premium/{{country_code}}",
+                "method": "GET",
+                "description": (
+                    "PREMIUM: Enhanced economic analysis with recession risk scoring (0-1 scale), "
+                    "extended indicators (trade, savings, debt, industrial output, FDI), "
+                    "plain-language interpretation, and signal summary. Includes all basic indicators "
+                    "plus computed recession risk level (low/moderate/elevated/high)."
+                ),
+                "price": PREMIUM_PRICE,
                 "network": NETWORK,
                 "asset": ASSET_ADDRESS,
                 "payTo": PAY_TO_ADDRESS,
@@ -1194,29 +1638,57 @@ _LLMS_TXT = f"""# Macro Pulse
 
 > Pay-per-call macroeconomic indicator API for AI agents. Computes a per-country
 > economic momentum score from World Bank Open Data (GDP growth, inflation,
-> unemployment trend), synthesized into one directional signal. Settled in
-> USDC on Base mainnet via the x402 protocol. No signup, no API key.
+> unemployment trend), synthesized into one directional signal. Premium tier adds
+> recession risk scoring and extended indicators. Settled in USDC on Base mainnet
+> via the x402 protocol. No signup, no API key.
 
-## Endpoints
+## Try Free First
+
+- GET {PUBLIC_BASE_URL}/macro-pulse/preview/US — FREE (also GB, DE)
+  Try the API output before paying. Same format as paid endpoints.
+
+## Paid Endpoints
 
 - GET {PUBLIC_BASE_URL}/macro-pulse/{{country_code}} — {PRICE} per call.
-  ISO 3166-1 alpha-2 or alpha-3 country code (e.g. US, GB, JP, DEU).
-  Example: {PUBLIC_BASE_URL}/macro-pulse/US
+  Basic momentum score with GDP growth, inflation, unemployment trend.
+  Example: {PUBLIC_BASE_URL}/macro-pulse/JP
+
+- GET {PUBLIC_BASE_URL}/macro-pulse-premium/{{country_code}} — {PREMIUM_PRICE} per call.
+  Enhanced analysis with recession risk score (0-1), extended indicators
+  (trade balance, savings, debt, industrial output, FDI), and plain-language
+  signal interpretation. Example: {PUBLIC_BASE_URL}/macro-pulse-premium/US
+
 - GET {PUBLIC_BASE_URL}/macro-pulse-batch/{{country_codes}} — {BATCH_PRICE} flat,
   up to {MAX_BATCH_COUNTRIES} comma-separated country codes in one call.
-  Example: {PUBLIC_BASE_URL}/macro-pulse-batch/US,GB,JP
+  Example: {PUBLIC_BASE_URL}/macro-pulse-batch/US,GB,JP,DE
 
 ## Payment
 
-Both endpoints return HTTP 402 with an x402 v2 payment-required payload
+Paid endpoints return HTTP 402 with an x402 v2 payment-required payload
 (scheme: exact, network: {NETWORK}, asset: USDC) until paid. No account or
 API key is ever required — pay per call and get the response in the same
 round trip.
 
 Prefer a monthly card subscription instead of per-call USDC? Subscribe at
 {PUBLIC_BASE_URL}/subscribe ({STRIPE_PRICE_LABEL}) and pass the API key you
-receive as an `X-API-Key` header on either endpoint above to skip the x402
+receive as an `X-API-Key` header on any paid endpoint to skip the x402
 paywall entirely while your subscription is active.
+
+## What You Get
+
+Basic ({PRICE}):
+- GDP growth rate + trend momentum
+- Inflation rate + trend momentum  
+- Unemployment rate + trend momentum
+- Synthesized momentum score (improving/stable/deteriorating)
+
+Premium ({PREMIUM_PRICE}):
+- Everything in Basic, plus:
+- Recession risk score (0.0 = very low, 1.0 = very high)
+- Risk level (low/moderate/elevated/high)
+- Extended indicators: trade balance, savings rate, gov debt, industrial output, FDI
+- Plain-language interpretation and signal summary
+- Data freshness metadata
 
 ## Discovery manifest
 
@@ -1239,22 +1711,25 @@ async def llms_txt():
 # deciding whether a domain exposes a machine-usable API.
 @app.get("/.well-known/ai-plugin.json")
 async def ai_plugin_manifest():
+    preview_list = ", ".join(sorted(PREVIEW_COUNTRIES))
     return {
         "schema_version": "v1",
         "name_for_human": "Macro Pulse",
         "name_for_model": "macro_pulse",
         "description_for_human": (
             "Pay-per-call macroeconomic indicator API: per-country economic "
-            "momentum score from World Bank data."
+            "momentum score and recession risk analysis from World Bank data. "
+            "Free preview available for US, GB, DE."
         ),
         "description_for_model": (
-            "Use to get a quick macroeconomic momentum signal for a country "
-            "(GDP growth, inflation, unemployment trend synthesized into one "
-            "directional label) before financial analysis, market commentary, "
-            "or country-risk screening. Call GET /macro-pulse/{country_code} "
-            "for a single country, or GET /macro-pulse-batch/{country_codes} "
-            "for up to 8 at once. Both require x402 USDC payment on Base "
-            "mainnet — no API key."
+            f"Use to get macroeconomic analysis for a country before financial "
+            f"analysis, market commentary, or risk screening. "
+            f"FREE: GET /macro-pulse/preview/{{country_code}} for {preview_list}. "
+            f"BASIC ({PRICE}): GET /macro-pulse/{{country_code}} for momentum score. "
+            f"PREMIUM ({PREMIUM_PRICE}): GET /macro-pulse-premium/{{country_code}} "
+            f"for recession risk scoring, extended indicators, and signal interpretation. "
+            f"BATCH ({BATCH_PRICE}): GET /macro-pulse-batch/{{country_codes}} for up to 8 countries. "
+            f"Paid endpoints require x402 USDC payment on Base mainnet — no API key needed."
         ),
         "auth": {"type": "none"},
         "api": {"type": "openapi", "url": f"{PUBLIC_BASE_URL}/openapi.json"},
