@@ -48,9 +48,33 @@ from x402.extensions.bazaar import (
     DeclareMcpDiscoveryConfig,
     OutputConfig,
     bazaar_resource_server_extension,
-    declare_discovery_extension,
+    declare_discovery_extension as _declare_discovery_extension,
     declare_mcp_discovery_extension,
 )
+import pycountry
+
+
+def declare_discovery_extension_with_method(
+    method: str,
+    path_params_schema: dict | None = None,
+    output: OutputConfig | None = None,
+    **kwargs
+) -> dict:
+    """Wrapper around declare_discovery_extension that injects method into info.input.
+
+    The x402 SDK's declare_discovery_extension creates a schema requiring 'method' in
+    info.input, but doesn't populate it - that's supposed to happen at runtime via
+    bazaar_resource_server_extension. However, validation happens before that injection,
+    causing "input: 'method' is a required property" warnings. This wrapper manually
+    adds the method field to avoid validation failures and ensure proper Bazaar indexing.
+    """
+    ext = _declare_discovery_extension(
+        path_params_schema=path_params_schema,
+        output=output,
+        **kwargs
+    )
+    ext["bazaar"]["info"]["input"]["method"] = method
+    return ext
 from x402.http import CreateHeadersAuthProvider, FacilitatorConfig, HTTPFacilitatorClient
 from x402.http.middleware.fastapi import payment_middleware
 from x402.mechanisms.evm.exact.register import register_exact_evm_server
@@ -69,6 +93,46 @@ from x402.schemas import ResourceConfig
 from x402.schemas.payments import ResourceInfo
 
 import stripe_tier
+
+# ---------------------------------------------------------------------------
+# ISO 3166-1 country code validation
+# ---------------------------------------------------------------------------
+# Valid ISO 3166-1 alpha-2 and alpha-3 country codes (real countries only)
+_ISO_ALPHA2_CODES = frozenset(c.alpha_2 for c in pycountry.countries)
+_ISO_ALPHA3_CODES = frozenset(c.alpha_3 for c in pycountry.countries)
+_VALID_ISO_CODES = _ISO_ALPHA2_CODES | _ISO_ALPHA3_CODES
+
+# World Bank aggregate/region codes that look like country codes but are NOT
+# individual countries. These return data from World Bank API but charging for
+# them is misleading since they're just aggregates of real countries' data.
+_WORLD_BANK_AGGREGATES = frozenset({
+    "AFE", "AFW", "ARB", "CEB", "CSS", "EAP", "EAR", "EAS", "ECA", "ECS",
+    "EMU", "EUU", "FCS", "HIC", "HPC", "IBD", "IBT", "IDA", "IDB", "IDX",
+    "INX", "LAC", "LCN", "LDC", "LIC", "LMC", "LMY", "LTE", "MEA", "MIC",
+    "MNA", "NAC", "OED", "OSS", "PRE", "PSS", "PST", "SAS", "SSA", "SSF",
+    "SST", "TEA", "TEC", "TLA", "TMN", "TSA", "TSS", "UMC", "WLD",
+})
+
+
+def validate_country_code(code: str) -> tuple[bool, str | None]:
+    """Validate a country code against ISO 3166-1 and reject World Bank aggregates.
+
+    Returns (is_valid, error_message). If valid, error_message is None.
+    """
+    code_upper = code.upper()
+    if code_upper in _WORLD_BANK_AGGREGATES:
+        return False, (
+            f"'{code}' is a World Bank aggregate/region code, not an individual country. "
+            "This endpoint only accepts ISO 3166-1 country codes for individual nations "
+            "(e.g., US, GB, JP, DEU)."
+        )
+    if code_upper not in _VALID_ISO_CODES:
+        return False, (
+            f"'{code}' is not a valid ISO 3166-1 country code. "
+            "Use a 2-letter (alpha-2) or 3-letter (alpha-3) code, e.g., US, GB, JP, DEU."
+        )
+    return True, None
+
 
 # ---------------------------------------------------------------------------
 # Config — fill these in before going live
@@ -234,92 +298,6 @@ facilitator.settle = _debug_facilitator_settle
 print("X402_WIRE debug wrappers installed on facilitator client", flush=True)
 # --- End wire-level facilitator logging ---------------------------------------
 
-# --- Temporary debug logging -------------------------------------------------
-# The x402 middleware deliberately returns an empty body on failure (so payer
-# clients don't see internal details), which makes it impossible to diagnose
-# failures from the outside. Wrap the key server methods on our own server
-# instance with plain print()s (guaranteed to reach Render's log stream,
-# unlike the logging module which can get swallowed by uvicorn's own config)
-# so we can see exactly which step rejects the payment and why.
-import sys
-
-
-def _dbg(*parts):
-    print("X402_DEBUG", *parts, file=sys.stdout, flush=True)
-
-
-_orig_find_matching_requirements = server.find_matching_requirements
-_orig_validate_extensions = server.validate_extensions
-_orig_verify_payment = server.verify_payment
-_orig_settle_payment = server.settle_payment
-
-
-def _debug_find_matching_requirements(available, payload):
-    result = _orig_find_matching_requirements(available, payload)
-    try:
-        _dbg(
-            "find_matching_requirements -> matched=", result is not None,
-            "| available=", [(r.network, r.asset, r.pay_to, r.amount) for r in available],
-            "| payload.accepted=", getattr(payload, "accepted", None),
-        )
-    except Exception as e:
-        _dbg("find_matching_requirements logging failed:", repr(e))
-    return result
-
-
-def _debug_validate_extensions(payment_required, payment_payload):
-    result = _orig_validate_extensions(payment_required, payment_payload)
-    try:
-        _dbg("validate_extensions -> valid=", result.valid, "invalid_reason=", result.invalid_reason)
-    except Exception as e:
-        _dbg("validate_extensions logging failed:", repr(e))
-    return result
-
-
-async def _debug_verify_payment(*args, **kwargs):
-    try:
-        result = await _orig_verify_payment(*args, **kwargs)
-    except Exception as e:
-        _dbg("verify_payment RAISED:", repr(e))
-        raise
-    try:
-        _dbg(
-            "verify_payment -> is_valid=", result.is_valid,
-            "invalid_reason=", result.invalid_reason,
-            "invalid_message=", result.invalid_message,
-            "payer=", result.payer,
-        )
-    except Exception as e:
-        _dbg("verify_payment logging failed:", repr(e))
-    return result
-
-
-async def _debug_settle_payment(*args, **kwargs):
-    try:
-        result = await _orig_settle_payment(*args, **kwargs)
-    except Exception as e:
-        _dbg("settle_payment RAISED:", repr(e))
-        raise
-    try:
-        _dbg(
-            "settle_payment -> success=", result.success,
-            "error_reason=", result.error_reason,
-            "error_message=", result.error_message,
-            "transaction=", result.transaction,
-            "payer=", result.payer,
-        )
-    except Exception as e:
-        _dbg("settle_payment logging failed:", repr(e))
-    return result
-
-
-server.find_matching_requirements = _debug_find_matching_requirements
-server.validate_extensions = _debug_validate_extensions
-server.verify_payment = _debug_verify_payment
-server.settle_payment = _debug_settle_payment
-_dbg("debug wrappers installed at startup")
-# --- End temporary debug logging ---------------------------------------------
-
 routes = {
     "GET /macro-pulse/:country_code": {
         "accepts": {
@@ -335,7 +313,8 @@ routes = {
         # will index it using this description/schema/example so agents can
         # find and evaluate it programmatically. The payment_middleware below
         # auto-registers the bazaar extension because this key is present.
-        "extensions": declare_discovery_extension(
+        "extensions": declare_discovery_extension_with_method(
+            method="GET",
             path_params_schema={
                 "properties": {
                     "country_code": {
@@ -374,7 +353,8 @@ routes = {
             "regardless of country count -- cheaper than calling the single-country "
             "endpoint repeatedly."
         ),
-        "extensions": declare_discovery_extension(
+        "extensions": declare_discovery_extension_with_method(
+            method="GET",
             path_params_schema={
                 "properties": {
                     "country_codes": {
@@ -498,6 +478,36 @@ async def x402_middleware(request: Request, call_next):
                 },
             )
 
+        # Validate country codes BEFORE payment challenge -- reject fake/invalid
+        # codes and World Bank aggregates with 400, not 402, so callers don't
+        # get charged for requests that would inevitably fail after payment.
+        if path.startswith("/macro-pulse-batch/"):
+            # Batch endpoint: validate all comma-separated codes
+            codes = [c.strip().upper() for c in last_segment.split(",") if c.strip()]
+            if len(codes) > MAX_BATCH_COUNTRIES:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "too_many_countries",
+                        "message": f"Maximum {MAX_BATCH_COUNTRIES} countries per batch call. Got {len(codes)}.",
+                    },
+                )
+            for code in codes:
+                is_valid, error_msg = validate_country_code(code)
+                if not is_valid:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": "invalid_country_code", "message": error_msg},
+                    )
+        else:
+            # Single-country endpoint: validate the one code
+            is_valid, error_msg = validate_country_code(last_segment)
+            if not is_valid:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_country_code", "message": error_msg},
+                )
+
         # Stripe card-payment tier: an active-subscription API key skips the
         # x402 challenge entirely and goes straight to the real handler,
         # same as if payment had already been verified. Checked via Stripe
@@ -592,7 +602,7 @@ async def fetch_indicator(country_code: str, indicator: str) -> list[dict]:
 
 
 def compute_momentum(series: list[dict]) -> float | None:
-    """Simple trend: latest value minus average of prior values, in std-dev units."""
+    """Simple trend: latest value minus average of prior values."""
     values = [row["value"] for row in series]
     if len(values) < 2:
         return None
@@ -617,11 +627,15 @@ async def _compute_macro_pulse(country_code: str) -> dict:
     )
     results = {}
     for name, series in zip(names, series_list):
+        latest_val = series[0]["value"] if series else None
         results[name] = {
-            "latest_value": series[0]["value"] if series else None,
+            "latest_value": round(latest_val, 2) if latest_val is not None else None,
             "latest_year": series[0]["date"] if series else None,
             "trend_momentum": compute_momentum(series),
-            "history": [{"year": r["date"], "value": r["value"]} for r in series],
+            "history": [
+                {"year": r["date"], "value": round(r["value"], 2) if r["value"] is not None else None}
+                for r in series
+            ],
         }
 
     # Synthesize a single directional score: positive GDP momentum and falling
@@ -657,12 +671,11 @@ async def _compute_macro_pulse(country_code: str) -> dict:
 
 @app.api_route("/macro-pulse/{country_code}", methods=["GET", "HEAD"])
 async def macro_pulse(country_code: str):
-    if not COUNTRY_CODE_RE.match(country_code):
-        raise HTTPException(
-            status_code=400,
-            detail="country_code must be a 2 or 3 letter ISO 3166-1 code, e.g. US, GB, DEU.",
-        )
-    return await _compute_macro_pulse(country_code.upper())
+    code = country_code.upper()
+    is_valid, error_msg = validate_country_code(code)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=error_msg)
+    return await _compute_macro_pulse(code)
 
 
 # Explicit OPTIONS handlers for both paid routes. `routes` (above) has no
@@ -711,11 +724,9 @@ async def macro_pulse_batch(country_codes: str):
             detail=f"Maximum {MAX_BATCH_COUNTRIES} countries per batch call. Got {len(codes)}.",
         )
     for c in codes:
-        if not COUNTRY_CODE_RE.match(c):
-            raise HTTPException(
-                status_code=400,
-                detail=f"'{c}' is not a valid 2 or 3 letter ISO 3166-1 code.",
-            )
+        is_valid, error_msg = validate_country_code(c)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=error_msg)
     # Dedupe while preserving order so a lazy/buggy caller repeating a code
     # doesn't get charged for redundant work either.
     seen = set()
@@ -874,15 +885,11 @@ _macro_pulse_batch_paid = create_payment_wrapper(
 @_macro_pulse_paid
 async def mcp_macro_pulse(country_code: str):
     code = str(country_code).upper()
-    if not COUNTRY_CODE_RE.match(code):
+    is_valid, error_msg = validate_country_code(code)
+    if not is_valid:
         return CallToolResult(
             isError=True,
-            content=[
-                TextContent(
-                    type="text",
-                    text="country_code must be a 2 or 3 letter ISO 3166-1 code, e.g. US, GB, DEU.",
-                )
-            ],
+            content=[TextContent(type="text", text=error_msg)],
         )
     return await _compute_macro_pulse(code)
 
@@ -916,12 +923,11 @@ async def mcp_macro_pulse_batch(country_codes: str):
             ],
         )
     for c in codes:
-        if not COUNTRY_CODE_RE.match(c):
+        is_valid, error_msg = validate_country_code(c)
+        if not is_valid:
             return CallToolResult(
                 isError=True,
-                content=[
-                    TextContent(type="text", text=f"'{c}' is not a valid 2 or 3 letter ISO 3166-1 code.")
-                ],
+                content=[TextContent(type="text", text=error_msg)],
             )
     seen = set()
     unique_codes = [c for c in codes if not (c in seen or seen.add(c))]
