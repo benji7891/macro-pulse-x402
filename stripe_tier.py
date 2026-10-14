@@ -36,7 +36,9 @@ accidentally bypass payment).
 """
 
 import asyncio
+from collections import OrderedDict
 import secrets
+import threading
 import time
 
 import stripe
@@ -47,6 +49,61 @@ STRIPE_SECRET_KEY = None
 STRIPE_WEBHOOK_SECRET = None
 STRIPE_PRICE_ID = None
 PRICE_LABEL = "$9/month"
+
+
+# ---------------------------------------------------------------------------
+# Bounded LRU cache for API key validation (memory-safe)
+# ---------------------------------------------------------------------------
+# The original unbounded dict could grow without limit if probed with many
+# random API keys. This bounded version uses LRU eviction and TTL. 200
+# entries is plenty -- active Stripe subscribers are typically <100.
+# ---------------------------------------------------------------------------
+class _BoundedAPIKeyCache:
+    """Thread-safe LRU cache with TTL, specialized for API key validation."""
+
+    def __init__(self, max_size: int, ttl_seconds: float):
+        self._max_size = max_size
+        self._ttl = ttl_seconds
+        self._lock = threading.Lock()
+        self._data: OrderedDict[str, tuple[float, bool]] = OrderedDict()
+
+    def get(self, key: str) -> tuple[bool, bool | None]:
+        """Return (found, is_valid). If not found or stale, returns (False, None)."""
+        now = time.time()
+        with self._lock:
+            self._evict_stale(now)
+            entry = self._data.get(key)
+            if entry is None:
+                return False, None
+            ts, is_valid = entry
+            if (now - ts) >= self._ttl:
+                del self._data[key]
+                return False, None
+            self._data.move_to_end(key)
+            return True, is_valid
+
+    def set(self, key: str, is_valid: bool) -> None:
+        """Insert or update an entry, evicting oldest if over capacity."""
+        now = time.time()
+        with self._lock:
+            self._evict_stale(now)
+            if key in self._data:
+                del self._data[key]
+            self._data[key] = (now, is_valid)
+            while len(self._data) > self._max_size:
+                self._data.popitem(last=False)
+
+    def invalidate(self, key: str) -> None:
+        """Remove a single entry (if present)."""
+        with self._lock:
+            self._data.pop(key, None)
+
+    def _evict_stale(self, now: float) -> None:
+        """Remove all entries older than TTL (called under lock)."""
+        cutoff = now - self._ttl
+        keys_to_delete = [k for k, (ts, _) in self._data.items() if ts < cutoff]
+        for k in keys_to_delete:
+            del self._data[k]
 
 
 def configure(secret_key: str | None, webhook_secret: str | None, price_id: str | None, price_label: str = "$9/month"):
@@ -62,9 +119,15 @@ def configure(secret_key: str | None, webhook_secret: str | None, price_id: str 
 
 router = APIRouter()
 
-# api_key -> (checked_at_unix_ts, is_valid)
-_API_KEY_CACHE: dict[str, tuple[float, bool]] = {}
+# MEMORY FIX (Oct 2026): Replaced unbounded dict with bounded LRU cache.
+# The old dict could grow without limit if probed with random API keys,
+# contributing to Render's 512MB OOMs. 200 entries @ 5min TTL is plenty.
 API_KEY_CACHE_TTL_SECONDS = 5 * 60  # 5 minutes
+API_KEY_CACHE_MAX_SIZE = 200
+_API_KEY_CACHE = _BoundedAPIKeyCache(
+    max_size=API_KEY_CACHE_MAX_SIZE,
+    ttl_seconds=API_KEY_CACHE_TTL_SECONDS,
+)
 
 
 def _sync_check_api_key(api_key: str) -> bool:
@@ -82,12 +145,11 @@ async def is_active_api_key(api_key: str | None) -> bool:
     """Fail closed: no key, no Stripe config, or a Stripe error all -> False."""
     if not api_key or not STRIPE_SECRET_KEY:
         return False
-    now = time.time()
-    cached = _API_KEY_CACHE.get(api_key)
-    if cached is not None and (now - cached[0]) < API_KEY_CACHE_TTL_SECONDS:
-        return cached[1]
+    found, is_valid = _API_KEY_CACHE.get(api_key)
+    if found:
+        return is_valid
     valid = await asyncio.to_thread(_sync_check_api_key, api_key)
-    _API_KEY_CACHE[api_key] = (now, valid)
+    _API_KEY_CACHE.set(api_key, valid)
     return valid
 
 
@@ -201,7 +263,7 @@ async def stripe_webhook(request: Request):
             # Invalidate any stale cache entry so the very next request with
             # this brand-new key doesn't get a false "not found" from a
             # cached negative lookup made before it existed.
-            _API_KEY_CACHE.pop(api_key, None)
+            _API_KEY_CACHE.invalidate(api_key)
 
     # Cache invalidation on cancellation/deletion so a churned subscriber's
     # key stops working within the TTL window immediately, not just after
@@ -210,6 +272,6 @@ async def stripe_webhook(request: Request):
         sub = event["data"]["object"]
         api_key = sub.get("metadata", {}).get("api_key")
         if api_key:
-            _API_KEY_CACHE.pop(api_key, None)
+            _API_KEY_CACHE.invalidate(api_key)
 
     return {"received": True}
