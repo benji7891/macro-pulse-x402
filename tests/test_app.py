@@ -282,3 +282,134 @@ class TestDebugLoggingRemoved:
         assert hasattr(server, 'find_matching_requirements')
         method_name = server.find_matching_requirements.__name__ if hasattr(server.find_matching_requirements, '__name__') else ''
         assert 'debug' not in method_name.lower()
+
+
+class TestBoundedTTLCache:
+    """Tests for the BoundedTTLCache memory-safe implementation."""
+
+    def test_basic_get_set(self):
+        """Cache should store and retrieve values correctly."""
+        from app import BoundedTTLCache
+        
+        cache = BoundedTTLCache(max_size=10, ttl_seconds=60)
+        cache.set("key1", "value1")
+        
+        found, value = cache.get("key1")
+        assert found is True
+        assert value == "value1"
+
+    def test_missing_key_returns_not_found(self):
+        """Cache should return (False, None) for missing keys."""
+        from app import BoundedTTLCache
+        
+        cache = BoundedTTLCache(max_size=10, ttl_seconds=60)
+        
+        found, value = cache.get("nonexistent")
+        assert found is False
+        assert value is None
+
+    def test_lru_eviction(self):
+        """Cache should evict oldest entries when over capacity."""
+        from app import BoundedTTLCache
+        
+        cache = BoundedTTLCache(max_size=3, ttl_seconds=60)
+        cache.set("key1", "value1")
+        cache.set("key2", "value2")
+        cache.set("key3", "value3")
+        
+        assert len(cache) == 3
+        
+        cache.set("key4", "value4")
+        
+        assert len(cache) == 3
+        found1, _ = cache.get("key1")
+        assert found1 is False
+        found4, val4 = cache.get("key4")
+        assert found4 is True
+        assert val4 == "value4"
+
+    def test_lru_access_updates_order(self):
+        """Accessing a key should move it to the end (most recently used)."""
+        from app import BoundedTTLCache
+        
+        cache = BoundedTTLCache(max_size=3, ttl_seconds=60)
+        cache.set("key1", "value1")
+        cache.set("key2", "value2")
+        cache.set("key3", "value3")
+        
+        cache.get("key1")
+        
+        cache.set("key4", "value4")
+        
+        found1, _ = cache.get("key1")
+        found2, _ = cache.get("key2")
+        assert found1 is True
+        assert found2 is False
+
+    def test_ttl_expiration(self):
+        """Cache should expire entries after TTL."""
+        import time
+        from app import BoundedTTLCache
+        
+        cache = BoundedTTLCache(max_size=10, ttl_seconds=0.1)
+        cache.set("key1", "value1")
+        
+        found_before, _ = cache.get("key1")
+        assert found_before is True
+        
+        time.sleep(0.15)
+        
+        found_after, _ = cache.get("key1")
+        assert found_after is False
+
+    def test_invalidate(self):
+        """Cache should remove entries on invalidate."""
+        from app import BoundedTTLCache
+        
+        cache = BoundedTTLCache(max_size=10, ttl_seconds=60)
+        cache.set("key1", "value1")
+        
+        found_before, _ = cache.get("key1")
+        assert found_before is True
+        
+        cache.invalidate("key1")
+        
+        found_after, _ = cache.get("key1")
+        assert found_after is False
+
+    def test_invalidate_nonexistent_key(self):
+        """Invalidating a nonexistent key should not raise."""
+        from app import BoundedTTLCache
+        
+        cache = BoundedTTLCache(max_size=10, ttl_seconds=60)
+        cache.invalidate("nonexistent")
+
+    def test_memory_bounded_under_heavy_load(self):
+        """Cache should stay bounded even with many unique keys."""
+        from app import BoundedTTLCache
+        
+        max_size = 100
+        cache = BoundedTTLCache(max_size=max_size, ttl_seconds=60)
+        
+        for i in range(1000):
+            cache.set(f"key{i}", f"value{i}")
+        
+        assert len(cache) <= max_size
+
+
+class TestIndicatorCacheIsBounded:
+    """Tests to verify the indicator cache is bounded."""
+
+    def test_indicator_cache_is_bounded_instance(self):
+        """The indicator cache should be a BoundedTTLCache instance."""
+        import os
+        os.environ['PAY_TO_ADDRESS'] = '0xb4a9238c9400a7f1bb7924606ff2ea634a0f3ec4'
+        os.environ['NETWORK'] = 'eip155:84532'
+        os.environ['PUBLIC_BASE_URL'] = 'https://macro-pulse-x402.onrender.com'
+        
+        import importlib
+        import app
+        importlib.reload(app)
+        
+        assert isinstance(app._INDICATOR_CACHE, app.BoundedTTLCache)
+        assert app.INDICATOR_CACHE_MAX_SIZE == 600

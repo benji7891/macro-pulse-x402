@@ -28,15 +28,87 @@ by the underlying x402 EVM stack.
 import asyncio
 import base64
 import contextlib
+from collections import OrderedDict
 import json
 import os
 import random
 import re
+import threading
 import time
+from typing import Any, TypeVar
 import urllib.parse
 
 import httpx
 import jwt as pyjwt
+
+
+# ---------------------------------------------------------------------------
+# Bounded LRU cache with TTL eviction (memory-safe replacement for plain dicts)
+# ---------------------------------------------------------------------------
+# Render's free/starter tier has ~512MB RAM. Unbounded caches can exhaust
+# this under sustained traffic (Sep 9, Sep 20, Sep 27, Oct 6 2026 OOMs).
+# This class bounds the cache to a fixed number of entries (LRU eviction)
+# and removes stale entries on every access (TTL eviction).
+# ---------------------------------------------------------------------------
+_KT = TypeVar("_KT")
+_VT = TypeVar("_VT")
+
+
+class BoundedTTLCache:
+    """Thread-safe LRU cache with per-entry TTL and bounded size.
+
+    - max_size: maximum number of entries; oldest is evicted when exceeded.
+    - ttl_seconds: entries older than this are considered stale and evicted.
+    - Stale entries are removed lazily (on get/set) to avoid background threads.
+    """
+
+    def __init__(self, max_size: int, ttl_seconds: float):
+        self._max_size = max_size
+        self._ttl = ttl_seconds
+        self._lock = threading.Lock()
+        self._data: OrderedDict[Any, tuple[float, Any]] = OrderedDict()
+
+    def get(self, key: _KT) -> tuple[bool, _VT | None]:
+        """Return (found, value). If not found or stale, returns (False, None)."""
+        now = time.time()
+        with self._lock:
+            self._evict_stale(now)
+            entry = self._data.get(key)
+            if entry is None:
+                return False, None
+            ts, val = entry
+            if (now - ts) >= self._ttl:
+                del self._data[key]
+                return False, None
+            self._data.move_to_end(key)
+            return True, val
+
+    def set(self, key: _KT, value: _VT) -> None:
+        """Insert or update an entry, evicting oldest if over capacity."""
+        now = time.time()
+        with self._lock:
+            self._evict_stale(now)
+            if key in self._data:
+                del self._data[key]
+            self._data[key] = (now, value)
+            while len(self._data) > self._max_size:
+                self._data.popitem(last=False)
+
+    def invalidate(self, key: _KT) -> None:
+        """Remove a single entry (if present)."""
+        with self._lock:
+            self._data.pop(key, None)
+
+    def _evict_stale(self, now: float) -> None:
+        """Remove all entries older than TTL (called under lock)."""
+        cutoff = now - self._ttl
+        keys_to_delete = [k for k, (ts, _) in self._data.items() if ts < cutoff]
+        for k in keys_to_delete:
+            del self._data[k]
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._data)
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -541,15 +613,47 @@ INDICATORS = {
 # Only successful lookups are cached -- a failed/empty fetch is never stored,
 # so a transient World Bank outage self-heals on the next call instead of
 # being cached as "no data" for hours.
-_INDICATOR_CACHE: dict[tuple[str, str], tuple[float, list[dict]]] = {}
+#
+# MEMORY FIX (Oct 2026): Switched from unbounded dict to BoundedTTLCache.
+# With 195 countries x 3 indicators = 585 possible entries, 600 is generous.
+# Render's 512MB free tier OOM'd (Sep 9/20/27, Oct 6) because the old dict
+# never evicted stale entries -- they just accumulated. Now entries are
+# evicted both by TTL (6h) and by LRU when the cap is hit.
 INDICATOR_CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
+INDICATOR_CACHE_MAX_SIZE = 600  # ~195 countries x 3 indicators, with margin
+_INDICATOR_CACHE: BoundedTTLCache = BoundedTTLCache(
+    max_size=INDICATOR_CACHE_MAX_SIZE,
+    ttl_seconds=INDICATOR_CACHE_TTL_SECONDS,
+)
+
+# MEMORY FIX (Oct 2026): Shared httpx.AsyncClient for World Bank API calls.
+# Creating a new client per request in fetch_indicator() caused memory churn
+# (connection pools, SSL contexts created/destroyed rapidly). A single shared
+# client reuses connections and is closed cleanly on shutdown.
+_http_client: httpx.AsyncClient | None = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    """Return the shared HTTP client (created lazily, closed on app shutdown)."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=6)
+    return _http_client
+
+
+async def _close_http_client() -> None:
+    """Close the shared HTTP client (called on app shutdown)."""
+    global _http_client
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
 
 
 async def fetch_indicator(country_code: str, indicator: str) -> list[dict]:
     cache_key = (country_code, indicator)
-    cached = _INDICATOR_CACHE.get(cache_key)
-    if cached is not None and (time.time() - cached[0]) < INDICATOR_CACHE_TTL_SECONDS:
-        return cached[1]
+    found, cached_series = _INDICATOR_CACHE.get(cache_key)
+    if found:
+        return cached_series
 
     url = f"https://api.worldbank.org/v2/country/{country_code}/indicator/{indicator}"
     # NOTE: this must be "mrv" (most recent values), NOT "mrnev". The World
@@ -574,12 +678,12 @@ async def fetch_indicator(country_code: str, indicator: str) -> list[dict]:
     # case for the whole response -- not 3x that).
     data = None
     max_attempts = 3
+    client = _get_http_client()
     for attempt in range(max_attempts):
         try:
-            async with httpx.AsyncClient(timeout=6) as client:
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-                data = resp.json()
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
             break
         except (httpx.HTTPError, ValueError):
             if attempt < max_attempts - 1:
@@ -597,7 +701,7 @@ async def fetch_indicator(country_code: str, indicator: str) -> list[dict]:
         return []
     series = [row for row in data[1] if row.get("value") is not None]
     if series:
-        _INDICATOR_CACHE[cache_key] = (time.time(), series)
+        _INDICATOR_CACHE.set(cache_key, series)
     return series
 
 
@@ -965,7 +1069,11 @@ _existing_lifespan = app.router.lifespan_context
 async def _lifespan_with_mcp(app_: FastAPI):
     async with mcp_server.session_manager.run():
         async with _existing_lifespan(app_) as state:
-            yield state
+            try:
+                yield state
+            finally:
+                # MEMORY FIX (Oct 2026): Close shared HTTP client on shutdown.
+                await _close_http_client()
 
 
 app.router.lifespan_context = _lifespan_with_mcp
